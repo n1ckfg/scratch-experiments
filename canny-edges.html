@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Canny Edge Shader</title>
+    <!-- Load p5.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #222;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <script id="canny-edges-vs" type="x-shader/x-vertex">
+#version 300 es
+precision highp float;
+
+in vec3 aPosition;
+in vec2 aTexCoord;
+
+out vec2 vTexCoord;
+
+void main() {
+    // Copy the p5.js texture coordinates to the fragment shader
+    vTexCoord = aTexCoord;
+
+    // Convert vec3 position to vec4
+    vec4 positionVec4 = vec4(aPosition, 1.0);
+
+    // Scale the rect from p5's coordinate system to WebGL's coordinate system
+    positionVec4.xy = positionVec4.xy * 2.0 - 1.0;
+
+    // Set the output vertex position
+    gl_Position = positionVec4;
+}
+    </script>
+    <script id="canny-edges-fs" type="x-shader/x-fragment">
+#version 300 es
+precision highp float;
+
+in vec2 vTexCoord;
+
+uniform sampler2D uTexture;
+uniform vec2 uResolution;
+uniform vec2 uTextureSize;
+
+out vec4 fragColor;
+
+const float sigma = 1.0;
+const float lowThreshold = 0.2;
+const float highThreshold = 0.6;
+const float pi = 3.14159265359;
+
+// Sobel operators
+vec3 sobelKernel(vec4 pixel, vec2 uv, vec2 texelSize) {
+    vec2 dir = vec2(1.0, -1.0) * texelSize / length(vec2(1.0, -1.0));
+    
+    vec4 dE = texture(uTexture, uv + vec2(dir.x, dir.y));
+    vec4 dN = texture(uTexture, uv + vec2(-dir.x, dir.y));
+    vec4 dW = texture(uTexture, uv + vec2(dir.y, -dir.x));
+    vec4 dS = texture(uTexture, uv + vec2(-dir.y, -dir.x));
+    
+    vec3 Gx = dE.rgb - dW.rgb;
+    vec3 Gy = dN.rgb - dS.rgb;
+    
+    return abs(Gx) + abs(Gy);
+}
+
+// Box blur for noise reduction
+vec3 boxBlur(vec2 uv, vec2 texelSize, int iterations) {
+    vec3 color = vec3(0.0);
+    int sampleRange = 2;
+    
+    for (int x = -sampleRange; x <= sampleRange; x++) {
+        for (int y = -sampleRange; y <= sampleRange; y++) {
+            vec2 offset = vec2(float(x), float(y)) * texelSize;
+            color += texture(uTexture, uv + offset).rgb;
+        }
+    }
+    
+    color /= float((sampleRange * 2 + 1) * (sampleRange * 2 + 1));
+    return color;
+}
+
+// Gaussian approximation using box blurs
+vec3 gaussianBlur(vec2 uv, vec2 texelSize) {
+    return boxBlur(uv, texelSize, 3);
+}
+
+// Compute gradient magnitude and direction
+struct Gradient {
+    float magnitude;
+    float direction;
+};
+
+Gradient computeGradient(vec2 uv, vec2 texelSize) {
+    vec2 dir = vec2(texelSize.x, texelSize.y) * 0.5;
+    
+    vec2 left = vec2(-texelSize.x, 0.0);
+    vec2 right = vec2(texelSize.x, 0.0);
+    vec2 up = vec2(0.0, -texelSize.y);
+    vec2 down = vec2(0.0, texelSize.y);
+    
+    float l = texture(uTexture, uv + left).r;
+    float r = texture(uTexture, uv + right).r;
+    float t = texture(uTexture, uv + up).r;
+    float b = texture(uTexture, uv + down).r;
+    
+    float gx = r - l;
+    float gy = b - t;
+    
+    float magnitude = length(vec2(gx, gy));
+    float direction = atan(gy, gx);
+    direction = direction > 0.0 ? direction : direction + pi;
+    
+    return Gradient(magnitude, direction);
+}
+
+// Non-maximum suppression
+float nonMaxSuppression(vec2 uv, vec2 texelSize, Gradient g) {
+    float angle = g.direction;
+    int quadrant = int(mod(angle + pi/4.0, pi*2.0) * 2.0 / (pi/2.0));
+    
+    vec2 offset;
+    if (quadrant == 0 || quadrant == 4) {
+        offset = vec2(0.0, texelSize.y);
+    } else if (quadrant == 1 || quadrant == 3) {
+        offset = vec2(texelSize.x, texelSize.y);
+    } else if (quadrant == 2) {
+        offset = vec2(texelSize.x, 0.0);
+    } else {
+        offset = vec2(texelSize.x, -texelSize.y);
+    }
+    
+    float m1 = texture(uTexture, uv + offset).r;
+    float m2 = texture(uTexture, uv - offset).r;
+    
+    return g.magnitude > m1 && g.magnitude > m2 ? g.magnitude : 0.0;
+}
+
+// Hysteresis thresholding (simplified single-pass approximation)
+float hysteresis(vec2 uv, vec2 texelSize, float mag, float angle) {
+    mag = clamp(mag - lowThreshold, 0.0, 1.0);
+    mag = mag >= highThreshold ? 1.0 : mag;
+    return mag;
+}
+
+// Canny edge detection main function
+vec3 canny(vec2 uv, vec2 texelSize) {
+    // Note: The previous code was writing to gl_FragColor multiple times, which is illegal.
+    // I removed the intermediate gl_FragColor write from here.
+    vec3 blurred = gaussianBlur(uv, texelSize);
+    
+    Gradient g = computeGradient(uv, texelSize);
+    float nms = nonMaxSuppression(uv, texelSize, g);
+    float edge = hysteresis(uv, texelSize, nms, g.direction);
+    
+    return vec3(edge);
+}
+
+void main() {
+    // Fixed: Ensure texelSize maps to the actual texture size (uTextureSize is now correctly passed)
+    vec2 texelSize = vec2(1.0) / uTextureSize;
+    
+    // Use the texture coordinates provided from the vertex shader.
+    // p5.js has inverted y-coordinates, so flip it here if needed.
+    vec2 uv = vTexCoord;
+    uv.y = 1.0 - uv.y;
+    
+    vec3 edge = canny(uv, texelSize);
+    
+    // Output to fragColor as required by WebGL2 / GLSL ES 3.00
+    fragColor = vec4(edge, 1.0);
+}
+    </script>
+    <script>
+let edgeShader;
+let img;
+
+function preload() {
+    // Load the shaders from the inline script tags
+    const vertSrc = document.getElementById('canny-edges-vs').textContent;
+    const fragSrc = document.getElementById('canny-edges-fs').textContent;
+    edgeShader = createShader(vertSrc, fragSrc);
+    // Load the image
+    img = loadImage('./common/images/aah_skeleton.jpg');
+}
+
+function setup() {
+    createCanvas(windowWidth, windowHeight, WEBGL);
+    noStroke();
+    imageMode(CENTER);
+}
+
+function draw() {
+    background(0);
+
+    // Calculate aspect ratios to fit the image inside the canvas nicely
+    let imgAspect = img.width / img.height;
+    let canvasAspect = width / height;
+    
+    let drawWidth, drawHeight;
+    if (canvasAspect > imgAspect) {
+        drawHeight = height * 0.9;
+        drawWidth = drawHeight * imgAspect;
+    } else {
+        drawWidth = width * 0.9;
+        drawHeight = drawWidth / imgAspect;
+    }
+
+    // Apply the shader
+    shader(edgeShader);
+
+    // Set uniforms that the shader expects
+    edgeShader.setUniform('uTexture', img);
+    edgeShader.setUniform('uResolution', [drawWidth, drawHeight]);
+    edgeShader.setUniform('uTextureSize', [img.width, img.height]);
+
+    // Draw a rectangle that covers the canvas where the shader will be applied
+    rect(-drawWidth/2, -drawHeight/2, drawWidth, drawHeight);
+}
+
+function windowResized() {
+    resizeCanvas(windowWidth, windowHeight);
+}
+    </script>
+</body>
+</html>
