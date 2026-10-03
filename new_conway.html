@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Conway's Game of Life — Oscilloscope Bloom</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #ui {
+    position: fixed; top: 16px; left: 16px; z-index: 10;
+    font-family: 'Courier New', monospace; font-size: 13px;
+    color: #0fa; pointer-events: none;
+    text-shadow: 0 0 8px #0fa, 0 0 20px #0fa;
+    line-height: 1.6;
+  }
+  #ui span { opacity: 0.7; }
+  #controls {
+    position: fixed; bottom: 16px; left: 16px; z-index: 10;
+    font-family: 'Courier New', monospace; font-size: 12px;
+    color: #0a8;
+    text-shadow: 0 0 6px #0a8;
+    line-height: 1.8;
+  }
+  #controls button {
+    background: none; border: 1px solid #0a8; color: #0fa;
+    padding: 4px 12px; cursor: pointer; font-family: inherit;
+    font-size: 12px; text-shadow: 0 0 6px #0fa;
+    transition: all 0.2s;
+  }
+  #controls button:hover { background: #0a83; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div>GENERATION <span id="gen">0</span></div>
+  <div>POPULATION <span id="pop">0</span></div>
+  <div>DENSITY <span id="density">0</span></div>
+</div>
+<div id="controls">
+  <button id="btnToggle">PAUSE</button>
+  <button id="btnStep">STEP</button>
+  <button id="btnClear">CLEAR</button>
+  <button id="btnRandom">RANDOM</button>
+  <button id="btnPulse">PULSE</button>
+  <span style="margin-left:20px;opacity:0.5">CLICK TO TOGGLE CELLS</span>
+</div>
+
+<script>
+// ─── CONFIG ────────────────────────────────────────────────
+const GRID_W = 128;
+const GRID_H = 128;
+const CELL_SIZE = 4;
+const BIRTH_RULE = [3];
+const SURVIVE_RULE = [2, 3];
+const BLOOM_INTENSITY = 1.8;
+const BLOOM_THRESHOLD = 0.15;
+const BLOOM_RESOLUTION = 0.5;
+const TRAIL_ALPHA = 0.06;
+const CONNECTION_DIST = 3.5;
+const SCANLINE_SPEED = 0.3;
+const PHOSPHOR_GLOW = 0.6;
+
+// ─── CANVAS & GL SETUP ─────────────────────────────────────
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: false });
+if (!gl) { alert('WebGL2 required'); throw new Error(); }
+const extFloat = gl.getExtension('EXT_color_buffer_float');
+if (!extFloat) { alert('EXT_color_buffer_float required'); throw new Error(); }
+
+let W, H;
+function resize() {
+  W = canvas.width = window.innerWidth * devicePixelRatio;
+  H = canvas.height = window.innerHeight * devicePixelRatio;
+  gl.viewport(0, 0, W, H);
+  buildTargets();
+  initGridData();
+}
+window.addEventListener('resize', resize);
+
+// ─── SHADER SOURCES ────────────────────────────────────────
+const vsSource = `#version 300 es
+in vec2 a_position;
+out vec2 v_uv;
+void main() {
+  v_uv = a_position * 0.5 + 0.5;
+  gl_Position = vec4(a_position, 0.0, 1.0);
+}`;
+
+// Game of Life compute shader (using fragment shader ping-pong)
+const golFS = `#version 300 es
+precision highp float;
+uniform sampler2D u_tex;
+uniform vec2 u_resolution;
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+  vec2 px = 1.0 / u_resolution;
+  vec2 uv = v_uv;
+  int count = 0;
+  for (int y = -1; y <= 1; y++) {
+    for (int x = -1; x <= 1; x++) {
+      if (x == 0 && y == 0) continue;
+      float neighbor = texture(u_tex, uv + vec2(x, y) * px).r;
+      count += int(neighbor);
+    }
+  }
+  float cell = texture(u_tex, uv).r;
+  bool alive = cell > 0.5;
+  if (alive && (count == 2 || count == 3)) {
+    fragColor = vec4(1.0, 1.0, 1.0, 1.0);
+  } else if (!alive && count == 3) {
+    fragColor = vec4(1.0, 1.0, 1.0, 1.0);
+  } else {
+    fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+  }
+}`;
+
+// Render shader: draws cells as glowing oscilloscope lines
+const renderFS = `#version 300 es
+precision highp float;
+uniform sampler2D u_tex;
+uniform vec2 u_resolution;
+uniform float u_time;
+uniform float u_gen;
+in vec2 v_uv;
+out vec4 fragColor;
+
+const float GRID_W = 128.0;
+const float GRID_H = 128.0;
+const float SCANLINE_SPEED = 0.3;
+const float CONNECTION_DIST = 3.5;
+const float PHOSPHOR_GLOW = 0.6;
+
+vec3 palette(float t) {
+  vec3 a = vec3(0.5, 0.5, 0.5);
+  vec3 b = vec3(0.5, 0.5, 0.5);
+  vec3 c = vec3(1.0, 1.0, 1.0);
+  vec3 d = vec3(0.00, 0.10, 0.20);
+  return a + b * cos(6.28318 * (c * t + d));
+}
+
+vec3 palette2(float t) {
+  return vec3(
+    0.1 + 0.3 * sin(t * 3.0),
+    0.3 + 0.6 * sin(t * 2.5 + 1.0),
+    0.4 + 0.4 * sin(t * 2.0 + 2.0)
+  );
+}
+
+void main() {
+  vec2 px = 1.0 / u_resolution;
+  vec2 uv = v_uv;
+
+  float cell = texture(u_tex, uv).r;
+
+  vec2 gridUV = uv;
+  vec2 cellSize = vec2(GRID_W, GRID_H) / u_resolution;
+  vec2 gridPos = gridUV / cellSize;
+  vec2 cellCoord = floor(gridPos);
+
+  float current = texture(u_tex, gridUV).r;
+
+  float neighbors = 0.0;
+  vec2 neighborDirs[8];
+  neighborDirs[0] = vec2(-1.0, -1.0);
+  neighborDirs[1] = vec2(0.0, -1.0);
+  neighborDirs[2] = vec2(1.0, -1.0);
+  neighborDirs[3] = vec2(-1.0, 0.0);
+  neighborDirs[4] = vec2(1.0, 0.0);
+  neighborDirs[5] = vec2(-1.0, 1.0);
+  neighborDirs[6] = vec2(0.0, 1.0);
+  neighborDirs[7] = vec2(1.0, 1.0);
+
+  for (int i = 0; i < 8; i++) {
+    float n = texture(u_tex, gridUV + neighborDirs[i] * cellSize).r;
+    if (n > 0.5) {
+      neighbors += 1.0;
+    }
+  }
+
+  vec3 bg = vec3(0.005, 0.008, 0.003);
+  float scanline = sin(uv.y * u_resolution.y * 0.5 - u_time * 3.0) * 0.015;
+  bg += scanline;
+
+  float sweep = sin(uv.y * 200.0 - u_time * SCANLINE_SPEED * 10.0) * 0.5 + 0.5;
+  sweep = pow(sweep, 20.0) * 0.03;
+  bg += vec3(0.0, sweep * 0.5, sweep * 0.3);
+
+  vec3 color = bg;
+
+  if (current > 0.5) {
+    vec2 center = (cellCoord + vec2(0.5)) * cellSize;
+    vec2 dirToCenter = center - uv;
+    float distToCenter = length(dirToCenter);
+
+    float glow = exp(-distToCenter * 8.0) * 1.5;
+
+    float persistence = sin(u_gen * 0.1 + cellCoord.x * 0.5 + cellCoord.y * 0.3) * 0.5 + 0.5;
+
+    float colorT = mod(neighbors * 0.15 + u_time * 0.02 + cellCoord.x * 0.01 + cellCoord.y * 0.008, 1.0);
+    vec3 cellColor = mix(palette(colorT), palette2(persistence), 0.3);
+
+    float vectorGlow = glow * (1.0 + neighbors * 0.2);
+    color += cellColor * vectorGlow;
+
+    float core = exp(-distToCenter * 30.0);
+    color += vec3(0.8, 1.0, 0.9) * core * 0.8;
+
+    if (neighbors > 0.0) {
+      for (int i = 0; i < 8; i++) {
+        float n = texture(u_tex, gridUV + neighborDirs[i] * cellSize).r;
+        if (n <= 0.5) continue;
+
+        vec2 neighborDir = neighborDirs[i];
+        vec2 neighborCenter = (cellCoord + neighborDir + vec2(0.5)) * cellSize;
+
+        vec2 lineDir = normalize(neighborCenter - uv);
+        float proj = dot(center - uv, lineDir);
+        float perpDist = length((center - uv) - lineDir * proj);
+
+        float lineDist = exp(-perpDist * 60.0) * exp(-abs(proj) * 2.0);
+        float lineGlow = lineDist * 0.6;
+
+        float wobble = sin(proj * 50.0 + u_time * 2.0 + cellCoord.y) * 0.001;
+        lineGlow *= (1.0 + wobble * 5.0);
+
+        vec3 lineColor = mix(
+          palette(mod(colorT + 0.1, 1.0)),
+          vec3(0.0, 0.8, 0.6),
+          0.5
+        );
+        color += lineColor * lineGlow;
+      }
+    }
+
+    float jitter = sin(u_time * 3.0 + cellCoord.x * 1.7 + cellCoord.y * 2.3) * 0.002;
+    color += vec3(0.0, 0.05, 0.03) * jitter * 100.0;
+  }
+
+  if (current > 0.5) {
+    for (int dy = -6; dy <= 6; dy++) {
+      for (int dx = -6; dx <= 6; dx++) {
+        if (dx == 0 && dy == 0) continue;
+        float dist = sqrt(float(dx*dx + dy*dy));
+        if (dist > CONNECTION_DIST) continue;
+
+        vec2 sampleUV = gridUV + vec2(float(dx), float(dy)) * cellSize;
+        float farCell = texture(u_tex, sampleUV).r;
+        if (farCell > 0.5) {
+          vec2 farCenter = (cellCoord + vec2(float(dx) + 0.5, float(dy) + 0.5)) * cellSize;
+          vec2 dir = normalize(farCenter - uv);
+          float proj = dot(farCenter - uv, dir);
+          float perpDist = length((farCenter - uv) - dir * proj);
+
+          float fade = 1.0 / (1.0 + dist * dist * 0.5);
+          float line = exp(-perpDist * 80.0) * fade * 0.3;
+
+          float phase = mod(dist * 0.3 + u_time * 0.05, 1.0);
+          vec3 lineCol = palette(phase);
+          color += lineCol * line * PHOSPHOR_GLOW;
+
+          float traceGlow = exp(-perpDist * 15.0) * fade * 0.15;
+          color += lineCol * traceGlow * PHOSPHOR_GLOW * 0.5;
+        }
+      }
+    }
+  }
+
+  vec2 vigUV = uv * (1.0 - uv);
+  float vignette = vigUV.x * vigUV.y * 15.0;
+  vignette = clamp(pow(vignette, 0.25), 0.0, 1.0);
+  color *= vignette;
+
+  float brightness = length(color);
+  if (brightness > 0.3) {
+    float aberr = (brightness - 0.3) * 0.002;
+    float r = texture(u_tex, uv + vec2(aberr, 0.0)).r;
+    float b = texture(u_tex, uv - vec2(aberr, 0.0)).r;
+    color.r += r * aberr * 10.0;
+    color.b += b * aberr * 10.0;
+  }
+
+  fragColor = vec4(color, 1.0);
+}`;
+
+// Bloom extract shader
+const bloomExtractFS = `#version 300 es
+precision highp float;
+uniform sampler2D u_tex;
+uniform float u_threshold;
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+  vec3 color = texture(u_tex, v_uv).rgb;
+  float brightness = dot(color, vec3(0.2126, 0.7152, 0.0722));
+  vec3 blurred = max(color - u_threshold, vec3(0.0));
+  fragColor = vec4(blurred, 1.0);
+}`;
+
+// Gaussian blur shader
+const blurFS = `#version 300 es
+precision highp float;
+uniform sampler2D u_tex;
+uniform vec2 u_direction;
+uniform vec2 u_resolution;
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+  vec2 px = u_direction / u_resolution;
+  vec3 color = vec3(0.0);
+  color += texture(u_tex, v_uv - px * 4.0).rgb * 0.0162;
+  color += texture(u_tex, v_uv - px * 3.0).rgb * 0.0540;
+  color += texture(u_tex, v_uv - px * 2.0).rgb * 0.1216;
+  color += texture(u_tex, v_uv - px * 1.0).rgb * 0.1945;
+  color += texture(u_tex, v_uv).rgb * 0.2270;
+  color += texture(u_tex, v_uv + px * 1.0).rgb * 0.1945;
+  color += texture(u_tex, v_uv + px * 2.0).rgb * 0.1216;
+  color += texture(u_tex, v_uv + px * 3.0).rgb * 0.0540;
+  color += texture(u_tex, v_uv + px * 4.0).rgb * 0.0162;
+  fragColor = vec4(color, 1.0);
+}`;
+
+// Composite shader: combines scene + bloom + post-processing
+const compositeFS = `#version 300 es
+precision highp float;
+uniform sampler2D u_scene;
+uniform sampler2D u_bloom;
+uniform float u_bloomIntensity;
+uniform float u_time;
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+  vec3 scene = texture(u_scene, v_uv).rgb;
+  vec3 bloom = texture(u_bloom, v_uv).rgb;
+
+  // Add bloom
+  vec3 color = scene + bloom * u_bloomIntensity;
+
+  // Subtle phosphor color shift
+  color.r *= 0.95;
+  color.g *= 1.05;
+  color.b *= 0.9;
+
+  // CRT flicker
+  float flicker = 1.0 + sin(u_time * 60.0) * 0.003 + sin(u_time * 37.0) * 0.002;
+  color *= flicker;
+
+  // Tone mapping (Reinhard)
+  color = color / (1.0 + color);
+
+  // Gamma correction
+  color = pow(color, vec3(0.9));
+
+  // Add subtle green tint for phosphor feel
+  color += vec3(0.0, 0.01, 0.005);
+
+  fragColor = vec4(color, 1.0);
+}`;
+
+// ─── SHADER COMPILATION ────────────────────────────────────
+function createShader(src, type) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+    return null;
+  }
+  return s;
+}
+
+function createProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(p));
+    return null;
+  }
+  return p;
+}
+
+const vs = createShader(vsSource, gl.VERTEX_SHADER);
+
+const golProg = createProgram(vs, createShader(golFS, gl.FRAGMENT_SHADER));
+const renderProg = createProgram(vs, createShader(renderFS, gl.FRAGMENT_SHADER));
+const bloomExtractProg = createProgram(vs, createShader(bloomExtractFS, gl.FRAGMENT_SHADER));
+const blurProg = createProgram(vs, createShader(blurFS, gl.FRAGMENT_SHADER));
+const compositeProg = createProgram(vs, createShader(compositeFS, gl.FRAGMENT_SHADER));
+
+// ─── FULLSCREEN QUAD ───────────────────────────────────────
+const quadVAO = gl.createVertexArray();
+gl.bindVertexArray(quadVAO);
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const posLoc = gl.getAttribLocation(renderProg, 'a_position');
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+
+// ─── TEXTURE TARGETS (ping-pong for GoL) ───────────────────
+let texA, texB, fbA, fbB;
+let bloomTexA, bloomTexB, bloomFbA, bloomFbB;
+let blurTexA, blurTexB, blurFbA, blurFbB;
+
+function createTexture(w, h, internalFormat, format, type) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat || gl.RGBA32F, w || W, h || H, 0, format || gl.RGBA, type || gl.FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+function createFBO(tex) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return f;
+}
+
+function buildTargets() {
+  if (texA) { gl.deleteTexture(texA); gl.deleteTexture(texB); }
+  if (fbA) { gl.deleteFramebuffer(fbA); gl.deleteFramebuffer(fbB); }
+  if (bloomTexA) { gl.deleteTexture(bloomTexA); gl.deleteTexture(bloomTexB);
+    gl.deleteFramebuffer(bloomFbA); gl.deleteFramebuffer(bloomFbB); }
+  if (blurTexA) { gl.deleteTexture(blurTexA); gl.deleteTexture(blurTexB);
+    gl.deleteFramebuffer(blurFbA); gl.deleteFramebuffer(blurFbB); }
+
+  texA = createTexture(GRID_W, GRID_H, gl.RGBA32F, gl.RGBA, gl.FLOAT);
+  texB = createTexture(GRID_W, GRID_H, gl.RGBA32F, gl.RGBA, gl.FLOAT);
+  fbA = createFBO(texA); fbB = createFBO(texB);
+
+  const bw = Math.floor(W * BLOOM_RESOLUTION);
+  const bh = Math.floor(H * BLOOM_RESOLUTION);
+
+  bloomTexA = createTexture(bw, bh, gl.RGBA32F, gl.RGBA, gl.FLOAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  bloomFbA = createFBO(bloomTexA);
+
+  bloomTexB = createTexture(bw, bh, gl.RGBA32F, gl.RGBA, gl.FLOAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  bloomFbB = createFBO(bloomTexB);
+
+  blurTexA = createTexture(bw, bh, gl.RGBA32F, gl.RGBA, gl.FLOAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  blurFbA = createFBO(blurTexA);
+
+  blurTexB = createTexture(bw, bh, gl.RGBA32F, gl.RGBA, gl.FLOAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  blurFbB = createFBO(blurTexB);
+}
+
+function rebuildTargets() {
+  buildTargets();
+  initGridData();
+}
+
+// ─── GRID DATA ─────────────────────────────────────────────
+let grid = new Uint8Array(GRID_W * GRID_H);
+let generation = 0;
+let running = true;
+let lastStepTime = 0;
+const STEP_INTERVAL = 80; // ms between steps
+
+function idx(x, y) { return y * GRID_W + x; }
+
+function initGridData() {
+  grid.fill(0);
+  generation = 0;
+  uploadGrid();
+}
+
+function randomizeGrid() {
+  for (let i = 0; i < grid.length; i++) {
+    grid[i] = Math.random() < 0.3 ? 1 : 0;
+  }
+  generation = 0;
+  uploadGrid();
+}
+
+function clearGrid() {
+  grid.fill(0);
+  generation = 0;
+  uploadGrid();
+}
+
+function stepGrid() {
+  const next = new Uint8Array(GRID_W * GRID_H);
+  for (let y = 0; y < GRID_H; y++) {
+    for (let x = 0; x < GRID_W; x++) {
+      let n = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = (x + dx + GRID_W) % GRID_W;
+          const ny = (y + dy + GRID_H) % GRID_H;
+          n += grid[idx(nx, ny)];
+        }
+      }
+      const i = idx(x, y);
+      if (grid[i]) {
+        next[i] = (SURVIVE_RULE.includes(n)) ? 1 : 0;
+      } else {
+        next[i] = (BIRTH_RULE.includes(n)) ? 1 : 0;
+      }
+    }
+  }
+  grid = next;
+  generation++;
+  uploadGrid();
+}
+
+function uploadGrid() {
+  const data = new Float32Array(GRID_W * GRID_H);
+  let pop = 0;
+  for (let i = 0; i < grid.length; i++) {
+    data[i] = grid[i];
+    pop += grid[i];
+  }
+
+  const rgbaData = new Float32Array(GRID_W * GRID_H * 4);
+  for (let i = 0; i < grid.length; i++) {
+    rgbaData[i * 4] = grid[i];
+    rgbaData[i * 4 + 1] = grid[i];
+    rgbaData[i * 4 + 2] = grid[i];
+    rgbaData[i * 4 + 3] = 1.0;
+  }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbA);
+  gl.viewport(0, 0, GRID_W, GRID_H);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texA);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, GRID_W, GRID_H, 0, gl.RGBA, gl.FLOAT, rgbaData);
+
+  // Update UI
+  document.getElementById('gen').textContent = generation;
+  document.getElementById('pop').textContent = pop;
+  document.getElementById('density').textContent = (pop / (GRID_W * GRID_H) * 100).toFixed(1) + '%';
+}
+
+// ─── CLICK TO TOGGLE CELLS ─────────────────────────────────
+canvas.addEventListener('click', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / rect.width;
+  const y = 1.0 - (e.clientY - rect.top) / rect.height;
+
+  const cellSize = vec2(GRID_W, GRID_H) / vec2(W, H) / devicePixelRatio;
+  const gx = Math.floor(x / cellSize.x);
+  const gy = Math.floor(y / cellSize.y);
+
+  if (gx >= 0 && gx < GRID_W && gy >= 0 && gy < GRID_H) {
+    grid[idx(gx, gy)] = grid[idx(gx, gy)] ? 0 : 1;
+    uploadGrid();
+  }
+});
+
+function vec2(w, h) { return { x: w, y: h }; }
+
+// ─── PULSE PATTERNS ────────────────────────────────────────
+function pulseGliderGun() {
+  // Gosper glider gun
+  const gun = [
+    [24,0],[22,1],[24,1],[12,2],[13,2],[20,2],[21,2],[34,2],[35,2],
+    [11,3],[15,3],[20,3],[21,3],[34,3],[35,3],[0,4],[1,4],[10,4],
+    [16,4],[20,4],[21,4],[0,5],[1,5],[10,5],[14,5],[16,5],[17,5],
+    [22,5],[24,5],[10,6],[16,6],[24,6],[11,7],[15,7],[12,8],[13,8]
+  ];
+  clearGrid();
+  const ox = Math.floor(GRID_W / 2) - 20;
+  const oy = Math.floor(GRID_H / 2) - 10;
+  for (const [x, y] of gun) {
+    const nx = (ox + x) % GRID_W;
+    const ny = (oy + y) % GRID_H;
+    grid[idx(nx, ny)] = 1;
+  }
+  uploadGrid();
+}
+
+// ─── CONTROLS ──────────────────────────────────────────────
+document.getElementById('btnToggle').addEventListener('click', () => {
+  running = !running;
+  document.getElementById('btnToggle').textContent = running ? 'PAUSE' : 'PLAY';
+});
+
+document.getElementById('btnStep').addEventListener('click', () => {
+  running = false;
+  document.getElementById('btnToggle').textContent = 'PLAY';
+  stepGrid();
+});
+
+document.getElementById('btnClear').addEventListener('click', clearGrid);
+document.getElementById('btnRandom').addEventListener('click', randomizeGrid);
+document.getElementById('btnPulse').addEventListener('click', pulseGliderGun);
+
+// ─── RENDER LOOP ───────────────────────────────────────────
+let time = 0;
+let lastFrameTime = 0;
+
+function useProgram(prog) {
+  gl.useProgram(prog);
+  gl.bindVertexArray(quadVAO);
+}
+
+function bindTexture(unit, tex) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+}
+
+function drawQuad() {
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// Get uniform locations
+const golUniforms = {};
+['u_tex', 'u_resolution'].forEach(n => golUniforms[n] = gl.getUniformLocation(golProg, n));
+
+const renderUniforms = {};
+['u_tex', 'u_resolution', 'u_time', 'u_gen'].forEach(n => renderUniforms[n] = gl.getUniformLocation(renderProg, n));
+
+const bloomExtractUniforms = {};
+['u_tex', 'u_threshold'].forEach(n => bloomExtractUniforms[n] = gl.getUniformLocation(bloomExtractProg, n));
+
+const blurUniforms = {};
+['u_tex', 'u_direction', 'u_resolution'].forEach(n => blurUniforms[n] = gl.getUniformLocation(blurProg, n));
+
+const compositeUniforms = {};
+['u_scene', 'u_bloom', 'u_bloomIntensity', 'u_time'].forEach(n => compositeUniforms[n] = gl.getUniformLocation(compositeProg, n));
+
+function render(now) {
+  now *= 0.001;
+  const dt = now - lastFrameTime;
+  lastFrameTime = now;
+  time += dt;
+
+  // Step GoL at fixed interval
+  if (running && now * 1000 - lastStepTime > STEP_INTERVAL) {
+    stepGrid();
+    lastStepTime = now * 1000;
+  }
+
+  // ── Step 1: Game of Life compute (ping-pong) ──
+  gl.disable(gl.BLEND);
+  useProgram(golProg);
+  gl.uniform2f(golUniforms.u_resolution, GRID_W, GRID_H);
+  bindTexture(0, texA);
+  gl.uniform1i(golUniforms.u_tex, 0);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbB);
+  gl.viewport(0, 0, GRID_W, GRID_H);
+  drawQuad();
+
+  // Swap
+  [texA, texB] = [texB, texA];
+  [fbA, fbB] = [fbB, fbA];
+
+  // ── Step 2: Render oscilloscope scene ──
+  useProgram(renderProg);
+  gl.uniform2f(renderUniforms.u_resolution, W, H);
+  gl.uniform1f(renderUniforms.u_time, time);
+  gl.uniform1f(renderUniforms.u_gen, generation);
+  bindTexture(0, texA);
+  gl.uniform1i(renderUniforms.u_tex, 0);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  drawQuad();
+
+  // ── Step 3: Bloom extract ──
+  const bw = Math.floor(W * BLOOM_RESOLUTION);
+  const bh = Math.floor(H * BLOOM_RESOLUTION);
+
+  useProgram(bloomExtractProg);
+  gl.uniform1f(bloomExtractUniforms.u_threshold, BLOOM_THRESHOLD);
+  bindTexture(0, texA);
+  gl.uniform1i(bloomExtractUniforms.u_tex, 0);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFbA);
+  gl.viewport(0, 0, bw, bh);
+  drawQuad();
+
+  // ── Step 4: Multi-pass Gaussian blur (bloom) ──
+  let readTex = bloomTexA;
+  let writeFb = blurFbA;
+  let writeTex = blurTexA;
+
+  for (let pass = 0; pass < 6; pass++) {
+    // Horizontal
+    useProgram(blurProg);
+    gl.uniform2f(blurUniforms.u_resolution, bw, bh);
+    gl.uniform2f(blurUniforms.u_direction, 1.5, 0.0);
+    bindTexture(0, readTex);
+    gl.uniform1i(blurUniforms.u_tex, 0);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, writeFb);
+    gl.viewport(0, 0, bw, bh);
+    drawQuad();
+
+    // Swap for vertical pass
+    readTex = writeTex;
+    if (writeFb === blurFbA) {
+      writeFb = blurFbB;
+      writeTex = blurTexB;
+    } else {
+      writeFb = blurFbA;
+      writeTex = blurTexA;
+    }
+
+    // Vertical
+    gl.uniform2f(blurUniforms.u_direction, 0.0, 1.5);
+    bindTexture(0, readTex);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, writeFb);
+    drawQuad();
+
+    // Swap for next horizontal pass
+    readTex = writeTex;
+    if (writeFb === blurFbA) {
+      writeFb = blurFbB;
+      writeTex = blurTexB;
+    } else {
+      writeFb = blurFbA;
+      writeTex = blurTexA;
+    }
+  }
+
+  // Final bloom is in readTex
+  const finalBloom = readTex;
+
+  // ── Step 5: Composite scene + bloom ──
+  useProgram(compositeProg);
+  gl.uniform1f(compositeUniforms.u_bloomIntensity, BLOOM_INTENSITY);
+  gl.uniform1f(compositeUniforms.u_time, time);
+
+  bindTexture(0, texA);  // scene
+  gl.uniform1i(compositeUniforms.u_scene, 0);
+  bindTexture(1, finalBloom); // bloom
+  gl.uniform1i(compositeUniforms.u_bloom, 1);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  drawQuad();
+
+  requestAnimationFrame(render);
+}
+
+// ─── INIT ──────────────────────────────────────────────────
+resize();
+randomizeGrid();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

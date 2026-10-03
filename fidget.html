@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fidget</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; touch-action: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: true });
+if (!gl) throw new Error('webgl not supported');
+
+const vertex = `
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+`;
+
+const fragment = `
+precision highp float;
+uniform vec2 uRes;
+uniform vec2 uMouse;
+uniform float uTime;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes.xy;
+  vec2 p = (uv - 0.5) * uRes.y / uRes.x;
+  vec2 m = (uMouse - 0.5) * uRes.y / uRes.x;
+  float d = length(p - m);
+  float ripple = sin(d * 30.0 - uTime * 4.0) * exp(-d * 3.0);
+  vec3 base = vec3(0.08, 0.02, 0.01);
+  vec3 wave = vec3(0.35, 0.08, 0.02) * (0.5 + 0.5 * sin(uv.x * 18.0 + uTime)) * (0.5 + 0.5 * cos(uv.y * 18.0 - uTime * 0.7));
+  gl_FragColor = vec4(base + wave + vec3(1.0, 0.55, 0.1) * ripple * 0.8, 1.0);
+}
+`;
+
+function compile(src, type) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(vertex, gl.VERTEX_SHADER));
+gl.attachShader(prog, compile(fragment, gl.FRAGMENT_SHADER));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+  throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const aPos = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, aPos);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.bindBuffer(gl.ARRAY_BUFFER, aPos);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.uniform1i(gl.getUniformLocation(prog, 'aPos'), 0);
+
+const uRes = gl.getUniformLocation(prog, 'uRes');
+const uMouse = gl.getUniformLocation(prog, 'uMouse');
+const uTime = gl.getUniformLocation(prog, 'uTime');
+
+let mouse = [0.5, 0.5];
+const onPointer = (e) => {
+  const r = canvas.getBoundingClientRect();
+  mouse = [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
+};
+canvas.addEventListener('pointermove', onPointer);
+canvas.addEventListener('pointerdown', onPointer);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.floor(canvas.clientWidth * dpr);
+  const h = Math.floor(canvas.clientHeight * dpr);
+  canvas.width = w;
+  canvas.height = h;
+  gl.viewport(0, 0, w, h);
+  gl.uniform2f(uRes, w, h);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const start = performance.now();
+function frame(now) {
+  const t = (now - start) / 1000;
+  gl.uniform2f(uMouse, mouse[0], mouse[1]);
+  gl.uniform1f(uTime, t);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

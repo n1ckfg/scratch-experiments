@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Conway's Game of Life - WebGL</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; overflow: hidden; font-family: monospace; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #ui {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  button {
+    background: #222; color: #eee; border: 1px solid #444;
+    padding: 6px 14px; font: 13px monospace; cursor: pointer;
+    border-radius: 4px;
+  }
+  button:hover { background: #333; }
+  #info {
+    position: fixed; bottom: 12px; left: 12px; z-index: 10;
+    color: #888; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <button id="btnToggle">Pause</button>
+  <button id="btnRandom">Randomize</button>
+  <button id="btnClear">Clear</button>
+  <button id="btnInc">Speed +</button>
+  <button id="btnDec">Speed −</button>
+  <button id="btnPattern">Pattern: glider</button>
+</div>
+<div id="info">Click/drag to draw · Right-click to spawn pattern · Scroll to resize cells</div>
+
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false });
+if (!gl) { alert('WebGL not supported'); throw 'no webgl'; }
+
+/* ---------- config ---------- */
+let CELL_SIZE = 8;       // pixels per cell (scroll to change)
+let running = true;
+let generationsPerFrame = 1;
+
+/* ---------- grid (double-buffered) ---------- */
+let cols, rows, gridA, gridB;
+
+function allocGrid() {
+  cols = Math.floor(canvas.width / CELL_SIZE);
+  rows = Math.floor(canvas.height / CELL_SIZE);
+  // cap to reasonable size for JS performance
+  if (cols > 512) cols = 512;
+  if (rows > 512) rows = 512;
+  const size = cols * rows;
+  gridA = new Uint8Array(size);
+  gridB = new Uint8Array(size);
+}
+allocGrid();
+
+function idx(x, y) { return y * cols + x; }
+
+function randomize() {
+  const n = cols * rows;
+  for (let i = 0; i < n; i++) gridA[i] = Math.random() < 0.3 ? 1 : 0;
+}
+
+function step() {
+  // Optimized: unroll inner loop, avoid repeated array lookups
+  for (let y = 0; y < rows; y++) {
+    const yMod = (y + 1) % rows;
+    const yPrev = (y - 1 + rows) % rows;
+    const yBase = y * cols;
+    const yModBase = yMod * cols;
+    const yPrevBase = yPrev * cols;
+    for (let x = 0; x < cols; x++) {
+      const xMod = (x + 1) % cols;
+      const xPrev = (x - 1 + cols) % cols;
+      // Count neighbors using direct array access
+      let n = 0;
+      n += gridA[yPrevBase + xPrev];
+      n += gridA[yPrevBase + x];
+      n += gridA[yPrevBase + xMod];
+      n += gridA[yBase + xPrev];
+      n += gridA[yBase + xMod];
+      n += gridA[yModBase + xPrev];
+      n += gridA[yModBase + x];
+      n += gridA[yModBase + xMod];
+      const i = yBase + x;
+      gridB[i] = (gridA[i] === 1)
+        ? (n === 2 || n === 3 ? 1 : 0)
+        : (n === 3 ? 1 : 0);
+    }
+  }
+  [gridA, gridB] = [gridB, gridA];
+}
+
+/* ---------- WebGL shaders ---------- */
+const vsSource = `
+  attribute vec2 aPos;
+  void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+`;
+
+const fsSource = `
+  precision mediump float;
+  uniform float uCellSize;
+  uniform sampler2D uGrid;
+  uniform vec2 uGridSize;
+  void main() {
+    vec2 px = gl_FragCoord.xy;
+    vec2 cell = floor(px / uCellSize);
+    cell.y = uGridSize.y - 1.0 - cell.y;
+    vec2 uv = (cell + 0.5) / uGridSize;
+    float alive = texture2D(uGrid, uv).r;
+    vec3 color = mix(vec3(0.06, 0.06, 0.08), vec3(0.15, 0.85, 0.45), alive);
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+function compileShader(src, type) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+    throw 'shader compile';
+  }
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compileShader(vsSource, gl.VERTEX_SHADER));
+gl.attachShader(prog, compileShader(fsSource, gl.FRAGMENT_SHADER));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  console.error(gl.getProgramInfoLog(prog));
+  throw 'program link';
+}
+gl.useProgram(prog);
+
+// full-screen quad
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1, 1, -1, -1, 1,
+  -1, 1, 1, -1, 1, 1,
+]), gl.STATIC_DRAW);
+
+const aPos = gl.getAttribLocation(prog, 'aPos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const uCellSize = gl.getUniformLocation(prog, 'uCellSize');
+const uGrid = gl.getUniformLocation(prog, 'uGrid');
+const uGridSize = gl.getUniformLocation(prog, 'uGridSize');
+
+/* ---------- grid → texture ---------- */
+let gridTex = gl.createTexture();
+
+function uploadGrid() {
+  gl.bindTexture(gl.TEXTURE_2D, gridTex);
+  const rgba = new Uint8Array(cols * rows * 4);
+  for (let i = 0; i < cols * rows; i++) {
+    rgba[i * 4] = gridA[i] * 255;
+  }
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, cols, rows, 0,
+    gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+/* ---------- render ---------- */
+function render() {
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform1f(uCellSize, CELL_SIZE);
+  gl.uniform2f(uGridSize, cols, rows);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, gridTex);
+  gl.uniform1i(uGrid, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+/* ---------- resize ---------- */
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  const oldA = gridA.slice();
+  const oldCols = cols, oldRows = rows;
+  allocGrid();
+  const mc = Math.min(oldCols, cols), mr = Math.min(oldRows, rows);
+  for (let y = 0; y < mr; y++)
+    for (let x = 0; x < mc; x++)
+      gridA[idx(x, y)] = oldA[y * oldCols + x];
+  uploadGrid();
+}
+window.addEventListener('resize', resize);
+resize();
+randomize();
+uploadGrid();
+
+/* ---------- draw with mouse ---------- */
+let drawing = false;
+let drawValue = 1;
+let lastX = -1, lastY = -1;
+
+const patterns = {
+  glider: [[0,1],[1,2],[2,0],[2,1],[2,2]],
+  lwss: [[0,1],[0,3],[1,0],[2,0],[3,0],[3,3],[4,0],[4,1],[4,2]],
+  blinker: [[0,0],[0,1],[0,2]],
+  block: [[0,0],[0,1],[1,0],[1,1]],
+  beacon: [[0,0],[0,1],[1,0],[2,3],[3,2],[3,3]],
+  toad: [[0,1],[0,2],[0,3],[1,0],[1,1],[1,2]],
+  pulsar: [[-1,-2],[-1,-3],[-1,-4],[-2,-1],[-3,-1],[-4,-1],[-2,-6],[-3,-6],[-4,-6],[-1,-7],[-1,-8],[-1,-9],[-6,-2],[-6,-3],[-6,-4],[-7,-1],[-8,-1],[-9,-1],[-6,-7],[-6,-8],[-6,-9],[-7,-6],[-8,-6],[-9,-6],[1,-2],[1,-3],[1,-4],[2,-1],[3,-1],[4,-1],[2,-6],[3,-6],[4,-6],[1,-7],[1,-8],[1,-9],[6,-2],[6,-3],[6,-4],[7,-1],[8,-1],[9,-1],[6,-7],[6,-8],[6,-9],[7,-6],[8,-6],[9,-6],[-1,2],[-1,3],[-1,4],[-2,1],[-3,1],[-4,1],[-2,6],[-3,6],[-4,6],[-1,7],[-1,8],[-1,9],[-6,2],[-6,3],[-6,4],[-7,1],[-8,1],[-9,1],[-6,7],[-6,8],[-6,9],[-7,6],[-8,6],[-9,6],[1,2],[1,3],[1,4],[2,1],[3,1],[4,1],[2,6],[3,6],[4,6],[1,7],[1,8],[1,9],[6,2],[6,3],[6,4],[7,1],[8,1],[9,1],[6,7],[6,8],[6,9],[7,6],[8,6],[9,6]],
+};
+const patternNames = Object.keys(patterns);
+let currentPattern = 0;
+
+function setCell(x, y, val) {
+  if (x >= 0 && x < cols && y >= 0 && y < rows)
+    gridA[idx(x, y)] = val;
+}
+
+function drawLine(x0, y0, x1, y1, val) {
+  const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  while (true) {
+    setCell(x0, y0, val);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) { err -= dy; x0 += sx; }
+    if (e2 < dx) { err += dx; y0 += sy; }
+  }
+}
+
+function spawnPattern(cx, cy, name) {
+  const p = patterns[name];
+  for (const [dx, dy] of p) {
+    setCell(cx + dx, cy + dy, 1);
+  }
+}
+
+function getCell(e) {
+  const rect = canvas.getBoundingClientRect();
+  return [
+    Math.floor((e.clientX - rect.left) / CELL_SIZE),
+    Math.floor((e.clientY - rect.top) / CELL_SIZE)
+  ];
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (e.button === 2) {
+    const [x, y] = getCell(e);
+    spawnPattern(x, y, patternNames[currentPattern]);
+    uploadGrid();
+    return;
+  }
+  drawing = true;
+  const [x, y] = getCell(e);
+  drawValue = gridA[idx(x, y)] ? 0 : 1;
+  setCell(x, y, drawValue);
+  lastX = x; lastY = y;
+  uploadGrid();
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!drawing) return;
+  const [x, y] = getCell(e);
+  if (lastX >= 0) drawLine(lastX, lastY, x, y, drawValue);
+  lastX = x; lastY = y;
+  uploadGrid();
+});
+
+canvas.addEventListener('pointerup', () => { drawing = false; lastX = -1; });
+canvas.addEventListener('pointerleave', () => { drawing = false; lastX = -1; });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+/* ---------- controls ---------- */
+document.getElementById('btnToggle').onclick = () => {
+  running = !running;
+  document.getElementById('btnToggle').textContent = running ? 'Pause' : 'Play';
+};
+document.getElementById('btnRandom').onclick = () => { randomize(); uploadGrid(); };
+document.getElementById('btnClear').onclick = () => { gridA.fill(0); uploadGrid(); };
+document.getElementById('btnInc').onclick = () => { generationsPerFrame = Math.min(generationsPerFrame * 2, 256); };
+document.getElementById('btnDec').onclick = () => { generationsPerFrame = Math.max(Math.floor(generationsPerFrame / 2), 1); };
+document.getElementById('btnPattern').onclick = () => {
+  currentPattern = (currentPattern + 1) % patternNames.length;
+  document.getElementById('btnPattern').textContent = 'Pattern: ' + patternNames[currentPattern];
+};
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const oldA = gridA.slice();
+  const oldCols = cols, oldRows = rows;
+  CELL_SIZE = Math.max(2, Math.min(32, CELL_SIZE + (e.deltaY > 0 ? -1 : 1)));
+  allocGrid();
+  const mc = Math.min(oldCols, cols), mr = Math.min(oldRows, rows);
+  for (let y = 0; y < mr; y++)
+    for (let x = 0; x < mc; x++)
+      gridA[idx(x, y)] = oldA[y * oldCols + x];
+  uploadGrid();
+}, { passive: false });
+
+/* ---------- main loop ---------- */
+function frame() {
+  if (running) {
+    for (let i = 0; i < generationsPerFrame; i++) step();
+    uploadGrid();
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Artificial Life - CRT</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { preserveDrawingBuffer: false });
+if (!gl) { document.body.innerHTML = '<h1 style="color:#fff;text-align:center;margin-top:40vh">WebGL not supported</h1>'; throw 'no gl'; }
+
+/* --- shader sources --- */
+
+const vertSrc = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() {
+    v_uv = a_pos * 0.5 + 0.5;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+`;
+
+const fragSrc = `
+precision highp float;
+
+varying vec2 v_uv;
+uniform float u_time;
+uniform vec2 u_res;
+uniform sampler2D u_cell;
+uniform float u_spawn_time;
+
+#define PI 3.14159265359
+#define TAU 6.28318530718
+
+float hash2(vec2 p) {
+    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+float noise2(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash2(i);
+    float b = hash2(i + vec2(1.0, 0.0));
+    float c = hash2(i + vec2(0.0, 1.0));
+    float d = hash2(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm(vec2 p) {
+    float v = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 5; i++) {
+        v += a * noise2(p);
+        p *= 2.0;
+        a *= 0.5;
+    }
+    return v;
+}
+
+// Cellular automaton rules (B3/S23 - Conway's Game of Life)
+int countNeighbors(vec2 uv, float cell) {
+    int count = 0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            if (x == 0 && y == 0) continue;
+            vec2 offset = vec2(float(x), float(y)) / u_res;
+            if (texture2D(u_cell, uv + offset).r > 0.5) count++;
+        }
+    }
+    return count;
+}
+
+vec2 evolveCell(vec2 uv, float cell) {
+    int neighbors = countNeighbors(uv, cell);
+    float rng = hash2(uv * u_res + floor(u_time * 10.0));
+    float noiseRng = noise2(uv * u_res * 0.5 + floor(u_time * 10.0));
+    float mutationRate = noiseRng * 0.015;
+
+    if (cell > 0.5) {
+        // Living cell: deterministic survival with spatially-varying random death chance
+        if (neighbors == 2 || neighbors == 3) {
+            return rng > mutationRate ? vec2(1.0) : vec2(0.0);
+        } else {
+            return vec2(0.0);
+        }
+    } else {
+        // Dead cell: deterministic birth with spatially-varying random birth chance
+        if (neighbors == 3) {
+            return rng > mutationRate ? vec2(1.0) : vec2(0.0);
+        } else {
+            return rng > mutationRate * 0.3 ? vec2(1.0) : vec2(0.0);
+        }
+    }
+}
+
+// --- Pattern spawning ---
+
+float spawnGlider(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // Glider pattern
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 0.0) g = 1.0;
+    if (p.x >= 2.0 && p.x <= 2.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 3.0 && p.x <= 3.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 2.0 && p.x <= 2.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 3.0 && p.y <= 3.0) g = 1.0;
+    return g;
+}
+
+float spawnBlinker(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // Blinker (horizontal)
+    if (p.x >= 0.0 && p.x <= 2.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    return g;
+}
+
+float spawnToad(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // Toad
+    if (p.x >= 1.0 && p.x <= 2.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 3.0 && p.x <= 4.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 1.0 && p.x <= 2.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 3.0 && p.x <= 4.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    return g;
+}
+
+float spawnBeacon(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // Beacon
+    if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 0.0) g = 1.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 0.0 && p.y <= 0.0) g = 1.0;
+    if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 3.0 && p.x <= 4.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 3.0 && p.x <= 4.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 3.0 && p.y <= 3.0) g = 1.0;
+    if (p.x >= 1.0 && p.x <= 2.0 && p.y >= 3.0 && p.y <= 3.0) g = 1.0;
+    return g;
+}
+
+float spawnPulsar(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // Pulsar (partial, smaller version)
+    float a = 0.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 0.0 && p.y <= 0.0) a = 1.0;
+    if (p.x >= 5.0 && p.x <= 6.0 && p.y >= 0.0 && p.y <= 0.0) a = 1.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 3.0 && p.y <= 3.0) a = 1.0;
+    if (p.x >= 5.0 && p.x <= 6.0 && p.y >= 3.0 && p.y <= 3.0) a = 1.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 5.0 && p.y <= 5.0) a = 1.0;
+    if (p.x >= 5.0 && p.x <= 6.0 && p.y >= 5.0 && p.y <= 5.0) a = 1.0;
+    if (p.x >= 0.0 && p.x <= 0.0 && p.y >= 2.0 && p.y <= 3.0) a = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 2.0 && p.y <= 3.0) a = 1.0;
+    if (p.x >= 0.0 && p.x <= 0.0 && p.y >= 5.0 && p.y <= 6.0) a = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 5.0 && p.y <= 6.0) a = 1.0;
+    if (p.x >= 3.0 && p.x <= 3.0 && p.y >= 2.0 && p.y <= 3.0) a = 1.0;
+    if (p.x >= 4.0 && p.x <= 4.0 && p.y >= 2.0 && p.y <= 3.0) a = 1.0;
+    if (p.x >= 3.0 && p.x <= 3.0 && p.y >= 5.0 && p.y <= 6.0) a = 1.0;
+    if (p.x >= 4.0 && p.x <= 4.0 && p.y >= 5.0 && p.y <= 6.0) a = 1.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 8.0 && p.y <= 8.0) a = 1.0;
+    if (p.x >= 5.0 && p.x <= 6.0 && p.y >= 8.0 && p.y <= 8.0) a = 1.0;
+    if (p.x >= 2.0 && p.x <= 3.0 && p.y >= 11.0 && p.y <= 11.0) a = 1.0;
+    if (p.x >= 5.0 && p.x <= 6.0 && p.y >= 11.0 && p.y <= 11.0) a = 1.0;
+    if (p.x >= 0.0 && p.x <= 0.0 && p.y >= 8.0 && p.y <= 9.0) a = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 8.0 && p.y <= 9.0) a = 1.0;
+    if (p.x >= 0.0 && p.x <= 0.0 && p.y >= 11.0 && p.y <= 12.0) a = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 11.0 && p.y <= 12.0) a = 1.0;
+    if (p.x >= 3.0 && p.x <= 3.0 && p.y >= 8.0 && p.y <= 9.0) a = 1.0;
+    if (p.x >= 4.0 && p.x <= 4.0 && p.y >= 8.0 && p.y <= 9.0) a = 1.0;
+    if (p.x >= 3.0 && p.x <= 3.0 && p.y >= 11.0 && p.y <= 12.0) a = 1.0;
+    if (p.x >= 4.0 && p.x <= 4.0 && p.y >= 11.0 && p.y <= 12.0) a = 1.0;
+    g = a;
+    return g;
+}
+
+float spawnGliderGun(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // Gosper glider gun (compact version)
+    float a = 0.0;
+    if (p.x >= 20.0 && p.x <= 24.0 && p.y >= 0.0 && p.y <= 4.0) a = 1.0;
+    if (p.x >= 22.0 && p.x <= 22.0 && p.y >= 0.0 && p.y <= 4.0) a = 1.0;
+    if (p.x >= 24.0 && p.x <= 24.0 && p.y >= 0.0 && p.y <= 4.0) a = 1.0;
+    if (p.x >= 12.0 && p.x <= 13.0 && p.y >= 6.0 && p.y <= 6.0) a = 1.0;
+    if (p.x >= 14.0 && p.x <= 14.0 && p.y >= 5.0 && p.y <= 7.0) a = 1.0;
+    if (p.x >= 15.0 && p.x <= 15.0 && p.y >= 6.0 && p.y <= 6.0) a = 1.0;
+    if (p.x >= 24.0 && p.x <= 24.0 && p.y >= 6.0 && p.y <= 6.0) a = 1.0;
+    if (p.x >= 25.0 && p.x <= 25.0 && p.y >= 5.0 && p.y <= 7.0) a = 1.0;
+    if (p.x >= 34.0 && p.x <= 35.0 && p.y >= 4.0 && p.y <= 4.0) a = 1.0;
+    if (p.x >= 36.0 && p.x <= 36.0 && p.y >= 3.0 && p.y <= 5.0) a = 1.0;
+    if (p.x >= 37.0 && p.x <= 37.0 && p.y >= 4.0 && p.y <= 4.0) a = 1.0;
+    if (p.x >= 34.0 && p.x <= 35.0 && p.y >= 6.0 && p.y <= 6.0) a = 1.0;
+    if (p.x >= 36.0 && p.x <= 36.0 && p.y >= 7.0 && p.y <= 9.0) a = 1.0;
+    if (p.x >= 37.0 && p.x <= 37.0 && p.y >= 8.0 && p.y <= 8.0) a = 1.0;
+    if (p.x >= 20.0 && p.x <= 24.0 && p.y >= 16.0 && p.y <= 20.0) a = 1.0;
+    if (p.x >= 22.0 && p.x <= 22.0 && p.y >= 16.0 && p.y <= 20.0) a = 1.0;
+    if (p.x >= 24.0 && p.x <= 24.0 && p.y >= 16.0 && p.y <= 20.0) a = 1.0;
+    if (p.x >= 12.0 && p.x <= 13.0 && p.y >= 18.0 && p.y <= 18.0) a = 1.0;
+    if (p.x >= 14.0 && p.x <= 14.0 && p.y >= 17.0 && p.y <= 19.0) a = 1.0;
+    if (p.x >= 15.0 && p.x <= 15.0 && p.y >= 18.0 && p.y <= 18.0) a = 1.0;
+    if (p.x >= 16.0 && p.x <= 16.0 && p.y >= 17.0 && p.y <= 19.0) a = 1.0;
+    if (p.x >= 17.0 && p.x <= 17.0 && p.y >= 18.0 && p.y <= 18.0) a = 1.0;
+    if (p.x >= 28.0 && p.x <= 28.0 && p.y >= 16.0 && p.y <= 20.0) a = 1.0;
+    if (p.x >= 29.0 && p.x <= 29.0 && p.y >= 17.0 && p.y <= 17.0) a = 1.0;
+    if (p.x >= 30.0 && p.x <= 30.0 && p.y >= 18.0 && p.y <= 18.0) a = 1.0;
+    if (p.x >= 31.0 && p.x <= 31.0 && p.y >= 19.0 && p.y <= 19.0) a = 1.0;
+    if (p.x >= 32.0 && p.x <= 32.0 && p.y >= 18.0 && p.y <= 18.0) a = 1.0;
+    if (p.x >= 33.0 && p.x <= 33.0 && p.y >= 17.0 && p.y <= 17.0) a = 1.0;
+    if (p.x >= 12.0 && p.x <= 13.0 && p.y >= 20.0 && p.y <= 20.0) a = 1.0;
+    if (p.x >= 14.0 && p.x <= 14.0 && p.y >= 21.0 && p.y <= 21.0) a = 1.0;
+    if (p.x >= 15.0 && p.x <= 15.0 && p.y >= 20.0 && p.y <= 20.0) a = 1.0;
+    if (p.x >= 22.0 && p.x <= 24.0 && p.y >= 24.0 && p.y <= 24.0) a = 1.0;
+    if (p.x >= 23.0 && p.x <= 23.0 && p.y >= 23.0 && p.y <= 25.0) a = 1.0;
+    if (p.x >= 24.0 && p.x <= 24.0 && p.y >= 24.0 && p.y <= 24.0) a = 1.0;
+    g = a;
+    return g;
+}
+
+float spawnRpentamino(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // R-pentomino
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 0.0) g = 1.0;
+    if (p.x >= 2.0 && p.x <= 2.0 && p.y >= 0.0 && p.y <= 0.0) g = 1.0;
+    if (p.x >= 2.0 && p.x <= 2.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    return g;
+}
+
+float spawnDiehard(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // Diehard
+    if (p.x >= 6.0 && p.x <= 6.0 && p.y >= 0.0 && p.y <= 0.0) g = 1.0;
+    if (p.x >= 5.0 && p.x <= 5.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 6.0 && p.x <= 6.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 4.0 && p.x <= 4.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 7.0 && p.x <= 7.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 7.0 && p.x <= 7.0 && p.y >= 3.0 && p.y <= 3.0) g = 1.0;
+    if (p.x >= 6.0 && p.x <= 6.0 && p.y >= 4.0 && p.y <= 4.0) g = 1.0;
+    return g;
+}
+
+float spawnAcorn(vec2 uv, vec2 origin, float scale) {
+    vec2 p = (uv - origin) * u_res / scale;
+    float g = 0.0;
+    // Acorn
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 0.0) g = 1.0;
+    if (p.x >= 3.0 && p.x <= 3.0 && p.y >= 1.0 && p.y <= 1.0) g = 1.0;
+    if (p.x >= 0.0 && p.x <= 0.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 2.0 && p.y <= 2.0) g = 1.0;
+    if (p.x >= 0.0 && p.x <= 0.0 && p.y >= 3.0 && p.y <= 3.0) g = 1.0;
+    if (p.x >= 0.0 && p.x <= 0.0 && p.y >= 5.0 && p.y <= 5.0) g = 1.0;
+    if (p.x >= 1.0 && p.x <= 1.0 && p.y >= 6.0 && p.y <= 6.0) g = 1.0;
+    return g;
+}
+
+float spawnPattern(vec2 uv, vec2 origin, float scale, int patternType) {
+    float g = 0.0;
+    if (patternType == 0) g = spawnGlider(uv, origin, scale);
+    else if (patternType == 1) g = spawnBlinker(uv, origin, scale);
+    else if (patternType == 2) g = spawnToad(uv, origin, scale);
+    else if (patternType == 3) g = spawnBeacon(uv, origin, scale);
+    else if (patternType == 4) g = spawnPulsar(uv, origin, scale);
+    else if (patternType == 5) g = spawnGliderGun(uv, origin, scale);
+    else if (patternType == 6) g = spawnRpentamino(uv, origin, scale);
+    else if (patternType == 7) g = spawnDiehard(uv, origin, scale);
+    else if (patternType == 8) g = spawnAcorn(uv, origin, scale);
+    return g;
+}
+
+float patternAt(vec2 uv) {
+    // Spawn patterns based on time
+    float spawnT = u_spawn_time;
+    float patternSeed = hash2(uv * 3.0 + floor(spawnT * 0.3));
+
+    // Check if a pattern should be spawned at this location
+    float spawnInterval = 3.0 + patternSeed * 7.0;
+    float spawnPhase = mod(spawnT, spawnInterval);
+    float spawnWindow = 0.5; // spawn window in seconds
+
+    if (spawnPhase < spawnWindow) {
+        // Determine pattern type based on position
+        float typeSeed = hash2(uv * 7.0 + floor(spawnT * 0.3));
+        int patternType = int(mod(typeSeed * 10.0, 9.0));
+
+        // Determine origin based on hash
+        float originX = hash2(floor(uv * u_res * 0.1) + floor(spawnT * 0.3));
+        float originY = hash2(floor(uv * u_res * 0.1) + floor(spawnT * 0.3) + 1.0);
+        vec2 origin = vec2(originX, originY);
+
+        // Scale based on pattern type
+        float scale = 3.0 + hash2(floor(uv * u_res * 0.2) + floor(spawnT * 0.3)) * 15.0;
+
+        return spawnPattern(uv, origin, scale, patternType);
+    }
+
+    return 0.0;
+}
+
+// Glider gun pattern
+bool isGliderGun(vec2 uv) {
+    vec2 p = uv * u_res;
+    // Gosper glider gun
+    float g = 0.0;
+    // Left block
+    if (p.x >= 20.0 && p.x <= 24.0 && p.y >= 0.0 && p.y <= 4.0) g = 1.0;
+    if (p.x >= 22.0 && p.x <= 22.0 && p.y >= 0.0 && p.y <= 4.0) g = 1.0;
+    if (p.x >= 24.0 && p.x <= 24.0 && p.y >= 0.0 && p.y <= 4.0) g = 1.0;
+    // Middle blocks
+    if (p.x >= 12.0 && p.x <= 13.0 && p.y >= 6.0 && p.y <= 6.0) g = 1.0;
+    if (p.x >= 14.0 && p.x <= 14.0 && p.y >= 5.0 && p.y <= 7.0) g = 1.0;
+    if (p.x >= 15.0 && p.x <= 15.0 && p.y >= 6.0 && p.y <= 6.0) g = 1.0;
+    if (p.x >= 24.0 && p.x <= 24.0 && p.y >= 6.0 && p.y <= 6.0) g = 1.0;
+    if (p.x >= 25.0 && p.x <= 25.0 && p.y >= 5.0 && p.y <= 7.0) g = 1.0;
+    // Right blocks
+    if (p.x >= 34.0 && p.x <= 35.0 && p.y >= 4.0 && p.y <= 4.0) g = 1.0;
+    if (p.x >= 36.0 && p.x <= 36.0 && p.y >= 3.0 && p.y <= 5.0) g = 1.0;
+    if (p.x >= 37.0 && p.x <= 37.0 && p.y >= 4.0 && p.y <= 4.0) g = 1.0;
+    // Bottom blocks
+    if (p.x >= 34.0 && p.x <= 35.0 && p.y >= 6.0 && p.y <= 6.0) g = 1.0;
+    if (p.x >= 36.0 && p.x <= 36.0 && p.y >= 7.0 && p.y <= 9.0) g = 1.0;
+    if (p.x >= 37.0 && p.x <= 37.0 && p.y >= 8.0 && p.y <= 8.0) g = 1.0;
+    // Top blocks
+    if (p.x >= 20.0 && p.x <= 24.0 && p.y >= 16.0 && p.y <= 20.0) g = 1.0;
+    if (p.x >= 22.0 && p.x <= 22.0 && p.y >= 16.0 && p.y <= 20.0) g = 1.0;
+    if (p.x >= 24.0 && p.x <= 24.0 && p.y >= 16.0 && p.y <= 20.0) g = 1.0;
+    // Middle bottom
+    if (p.x >= 12.0 && p.x <= 13.0 && p.y >= 18.0 && p.y <= 18.0) g = 1.0;
+    if (p.x >= 14.0 && p.x <= 14.0 && p.y >= 17.0 && p.y <= 19.0) g = 1.0;
+    if (p.x >= 15.0 && p.x <= 15.0 && p.y >= 18.0 && p.y <= 18.0) g = 1.0;
+    // Extra blocks
+    if (p.x >= 16.0 && p.x <= 16.0 && p.y >= 17.0 && p.y <= 19.0) g = 1.0;
+    if (p.x >= 17.0 && p.x <= 17.0 && p.y >= 18.0 && p.y <= 18.0) g = 1.0;
+    if (p.x >= 28.0 && p.x <= 28.0 && p.y >= 16.0 && p.y <= 20.0) g = 1.0;
+    if (p.x >= 29.0 && p.x <= 29.0 && p.y >= 17.0 && p.y <= 17.0) g = 1.0;
+    if (p.x >= 30.0 && p.x <= 30.0 && p.y >= 18.0 && p.y <= 18.0) g = 1.0;
+    if (p.x >= 31.0 && p.x <= 31.0 && p.y >= 19.0 && p.y <= 19.0) g = 1.0;
+    if (p.x >= 32.0 && p.x <= 32.0 && p.y >= 18.0 && p.y <= 18.0) g = 1.0;
+    if (p.x >= 33.0 && p.x <= 33.0 && p.y >= 17.0 && p.y <= 17.0) g = 1.0;
+    // Top middle
+    if (p.x >= 12.0 && p.x <= 13.0 && p.y >= 20.0 && p.y <= 20.0) g = 1.0;
+    if (p.x >= 14.0 && p.x <= 14.0 && p.y >= 21.0 && p.y <= 21.0) g = 1.0;
+    if (p.x >= 15.0 && p.x <= 15.0 && p.y >= 20.0 && p.y <= 20.0) g = 1.0;
+    // Bottom middle
+    if (p.x >= 22.0 && p.x <= 24.0 && p.y >= 24.0 && p.y <= 24.0) g = 1.0;
+    if (p.x >= 23.0 && p.x <= 23.0 && p.y >= 23.0 && p.y <= 25.0) g = 1.0;
+    if (p.x >= 24.0 && p.x <= 24.0 && p.y >= 24.0 && p.y <= 24.0) g = 1.0;
+    return g > 0.5;
+}
+
+void main() {
+    vec2 uv = v_uv;
+
+    // --- Cellular automaton ---
+    vec2 cell = evolveCell(uv, texture2D(u_cell, uv).r);
+
+    // --- Pattern spawning ---
+    float pattern = patternAt(uv);
+    float alive = cell.r;
+    float total = max(alive, pattern);
+    float patternAlpha = step(alive, pattern) * pattern;
+    float cellAlpha = step(pattern, alive) * alive;
+
+    // Color based on cell/pattern state - patterns get different color
+    vec3 phosphorGreen = vec3(0.12, 0.95, 0.18);
+    vec3 phosphorAmber = vec3(0.95, 0.7, 0.1);
+    vec3 phosphorCyan = vec3(0.15, 0.85, 0.95);
+    vec3 phosphorMagenta = vec3(0.95, 0.15, 0.7);
+    vec3 phosphorWhite = vec3(0.95, 0.95, 0.95);
+
+    // Vary color by position for phosphor stripe effect
+    float stripe = sin(uv.x * 120.0) * 0.5 + 0.5;
+    vec3 color;
+    if (stripe < 0.33) {
+        color = phosphorGreen;
+    } else if (stripe < 0.66) {
+        color = mix(phosphorGreen, phosphorAmber, 0.3);
+    } else {
+        color = mix(phosphorGreen, phosphorCyan, 0.2);
+    }
+
+    // Patterns shift color over time - morphing effect
+    float patternPhase = mod(u_time * 0.15, 1.0);
+    vec3 patternColor1 = mix(phosphorAmber, phosphorCyan, patternPhase);
+    vec3 patternColor2 = mix(phosphorCyan, phosphorMagenta, patternPhase);
+    vec3 patternColor = mix(patternColor1, patternColor2, sin(u_time * 0.3) * 0.5 + 0.5);
+
+    // Blend cell color with pattern color
+    float patternWeight = patternAlpha / (patternAlpha + cellAlpha + 0.001);
+    color = mix(color, patternColor, patternWeight);
+
+    // Add subtle glow
+    vec3 glow = vec3(0.0);
+    for (int i = 1; i <= 4; i++) {
+        float fi = float(i);
+        float cellGlow = cellAlpha * texture2D(u_cell, uv + vec2(fi, 0.0) / u_res).r / fi;
+        cellGlow += cellAlpha * texture2D(u_cell, uv - vec2(fi, 0.0) / u_res).r / fi;
+        cellGlow += cellAlpha * texture2D(u_cell, uv + vec2(0.0, fi) / u_res).r / fi;
+        cellGlow += cellAlpha * texture2D(u_cell, uv - vec2(0.0, fi) / u_res).r / fi;
+        float patGlow = patternAlpha * texture2D(u_cell, uv + vec2(fi, 0.0) / u_res).r / fi;
+        patGlow += patternAlpha * texture2D(u_cell, uv - vec2(fi, 0.0) / u_res).r / fi;
+        patGlow += patternAlpha * texture2D(u_cell, uv + vec2(0.0, fi) / u_res).r / fi;
+        patGlow += patternAlpha * texture2D(u_cell, uv - vec2(0.0, fi) / u_res).r / fi;
+        glow += cellGlow * vec3(0.08, 0.15, 0.08);
+        glow += patGlow * patternColor;
+    }
+    color += glow;
+
+    // Subtle pulsing glow
+    float pulse = sin(u_time * 1.5) * 0.03 + 0.03;
+    color += pulse * cellAlpha;
+    // Patterns pulse differently
+    float patternPulse = sin(u_time * 2.3 + uv.x * 10.0) * 0.04 + 0.04;
+    color += patternPulse * patternAlpha;
+
+    // --- CRT effects ---
+
+    // Scanlines
+    float scanline = sin(uv.y * u_res.y * 1.5) * 0.04;
+    color -= scanline;
+
+    // Sub-pixel RGB stripe pattern
+    float subpixel = sin(uv.x * u_res.x * 3.0) * 0.02;
+    color.r -= subpixel;
+    color.b += subpixel;
+
+    // Chromatic aberration at edges
+    float edgeDist = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    float aberration = pow(1.0 - edgeDist, 3.0) * 0.003;
+    vec2 aberrDir = normalize(uv - 0.5 + 0.001) * aberration;
+    color.r -= texture2D(u_cell, uv + aberrDir).r * cellAlpha * 0.15;
+    color.b += texture2D(u_cell, uv - aberrDir).r * cellAlpha * 0.15;
+    // Pattern aberration
+    color.r -= texture2D(u_cell, uv + aberrDir * 1.2).r * patternAlpha * 0.2;
+    color.b += texture2D(u_cell, uv - aberrDir * 1.2).r * patternAlpha * 0.2;
+
+    // Vignette
+    float vignette = 1.0 - pow(length(uv - 0.5) * 1.4, 2.0);
+    vignette = clamp(vignette, 0.0, 1.0);
+    vignette = vignette * vignette * 3.0;
+    color *= vignette;
+
+    // Barrel distortion
+    vec2 center = uv - 0.5;
+    float dist = length(center);
+    float distort = 1.0 + dist * dist * 0.08;
+    uv = center * distort + 0.5;
+
+    // CRT flicker
+    float flicker = sin(u_time * 120.0) * 0.003 + sin(u_time * 47.0) * 0.002;
+    color += flicker;
+
+    // Horizontal sync glitch
+    float glitchLine = step(0.999, fract(sin(u_time * 8.0) * 1000.0));
+    color += glitchLine * vec3(0.05, -0.02, 0.05);
+
+    // Random noise
+    float noiseVal = noise2(uv * u_res * 0.5 + u_time * 3.0) * 0.02;
+    color += noiseVal;
+
+    // Rolling bar effect
+    float roll = sin(uv.y * 2.0 + u_time * 0.3) * 0.015;
+    color -= roll;
+
+    // CRT curvature - darken corners
+    float corner = 1.0 - pow(length(center) * 1.1, 4.0);
+    corner = clamp(corner, 0.0, 1.0);
+    color *= mix(1.0, corner, 0.5);
+
+    // Slight phosphor decay (fading afterglow)
+    float afterglow = sin(u_time * 0.5) * 0.005;
+    color += afterglow * cellAlpha;
+    // Patterns have their own afterglow
+    float patternAfterglow = sin(u_time * 0.7 + uv.y * 8.0) * 0.008;
+    color += patternAfterglow * patternAlpha;
+
+    // Clamp
+    color = clamp(color, 0.0, 1.0);
+
+    gl_FragColor = vec4(color, 1.0);
+}
+`;
+
+/* --- Compile shaders --- */
+
+function createShader(src, type) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(s));
+        return null;
+    }
+    return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, createShader(vertSrc, gl.VERTEX_SHADER));
+gl.attachShader(prog, createShader(fragSrc, gl.FRAGMENT_SHADER));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(prog));
+    throw 'link fail';
+}
+gl.useProgram(prog);
+
+/* --- Buffers --- */
+
+const quad = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+const aPos = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+/* --- Framebuffer (for cellular automaton) --- */
+
+function createFBO(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fb, tex, w, h };
+}
+
+let cellW = 160;
+let cellH = 90;
+let fboA = createFBO(cellW, cellH);
+let fboB = createFBO(cellW, cellH);
+
+/* --- Initialize with glider gun --- */
+
+function initCells() {
+    const data = new Uint8Array(cellW * cellH * 4);
+    // Gosper glider gun centered
+    const ox = 10, oy = 10;
+    const gun = [
+        [20,0],[21,0],[22,0],[20,1],[21,1],[22,1],[12,2],[13,2],[20,2],[21,2],[22,2],[24,2],
+        [11,3],[13,3],[20,3],[21,3],[22,3],[24,3],[25,3],[10,4],[15,4],[20,4],[21,3],[22,4],
+        [24,4],[25,4],[10,5],[14,5],[16,5],[20,5],[21,5],[22,5],[24,5],[25,5],[10,6],[11,6],
+        [13,6],[15,6],[17,6],[20,6],[21,6],[22,6],[24,6],[25,6],[10,7],[11,7],[13,7],[15,7],
+        [17,7],[19,7],[21,7],[22,7],[10,8],[11,8],[13,8],[15,8],[17,7],[21,8],[22,8],[10,9],
+        [13,9],[15,9],[17,9],[21,9],[22,8],[11,10],[13,10],[15,10],[17,10],[12,11],[14,11],
+        [16,11],[18,11],[11,12],[13,12],[15,12],[17,12],[12,13],[14,13],[16,13],[18,13],
+        [12,14],[14,14],[16,14],[18,14],[13,15],[15,15],[10,16],[11,16],[12,16],[10,17],
+        [11,17],[12,17],[10,18],[11,18],[12,18],[13,19],[11,20],[15,20],[10,21],[10,22],[11,22],
+        [12,22],[13,22],[14,22],[12,23],[14,23],[13,24],[15,24],
+    ];
+    for (const [gx, gy] of gun) {
+        const px = gx + ox, py = gy + oy;
+        if (px < cellW && py < cellH) {
+            const i = (py * cellW + px) * 4;
+            data[i] = 255; data[i+1] = 255; data[i+2] = 255; data[i+3] = 255;
+        }
+    }
+    // Scatter some random cells
+    for (let y = 0; y < cellH; y++) {
+        for (let x = 0; x < cellW; x++) {
+            if (Math.random() < 0.08) {
+                const i = (y * cellW + x) * 4;
+                data[i] = 255; data[i+1] = 255; data[i+2] = 255; data[i+3] = 255;
+            }
+        }
+    }
+    gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, cellW, cellH, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.bindTexture(gl.TEXTURE_2D, fboB.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, cellW, cellH, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+}
+initCells();
+
+/* --- Uniforms --- */
+
+const uTime = gl.getUniformLocation(prog, 'u_time');
+const uSpawnTime = gl.getUniformLocation(prog, 'u_spawn_time');
+const uRes = gl.getUniformLocation(prog, 'u_res');
+const uCell = gl.getUniformLocation(prog, 'u_cell');
+
+/* --- Resize --- */
+
+function resize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+}
+resize();
+window.addEventListener('resize', resize);
+
+/* --- Click to add glider --- */
+
+let clickPos = null;
+canvas.addEventListener('click', (e) => {
+    clickPos = [e.clientX / window.innerWidth, e.clientY / window.innerHeight];
+});
+
+/* --- Main loop --- */
+
+let lastTime = 0;
+let cellTimer = 0;
+const cellInterval = 0.08; // seconds per evolution step
+
+function render(now) {
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
+
+    cellTimer += dt;
+
+    // Evolve cells periodically
+    if (cellTimer >= cellInterval) {
+        cellTimer = 0;
+
+        // Evolve
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fboB.fb);
+        gl.viewport(0, 0, cellW, cellH);
+        gl.disable(gl.BLEND);
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+        gl.uniform1i(uCell, 0);
+        gl.uniform1f(uTime, 0);
+        gl.uniform1f(uSpawnTime, now / 1000);
+        gl.uniform2f(uRes, cellW, cellH);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        // Swap
+        let tmp = fboA; fboA = fboB; fboB = tmp;
+    }
+
+    // Render to screen
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+    gl.uniform1i(uCell, 0);
+    gl.uniform1f(uTime, now / 1000);
+    gl.uniform1f(uSpawnTime, now / 1000);
+    gl.uniform2f(uRes, cellW, cellH);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

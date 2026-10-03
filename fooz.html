@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>fooz</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl');
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.floor(innerWidth * dpr), h = Math.floor(innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+addEventListener('resize', resize);
+resize();
+
+const vsSrc = `
+attribute vec2 p;
+void main() { gl_Position = vec4(p, 0.0, 1.0); }
+`;
+
+const fsSrc = `
+precision highp float;
+uniform vec2 res;
+uniform float time;
+
+#define MAX_STEPS 96
+#define MAX_DIST 12.0
+#define SURF 0.0015
+
+float smin(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// coiled helix tube, wriggling
+float sdCoil(vec3 p, float t) {
+  // wriggle the whole coil
+  float w1 = sin(t * 0.7 + p.y * 0.6) * 0.35;
+  float w2 = cos(t * 0.9 + p.x * 0.5) * 0.35;
+  p.x += w1;
+  p.z += w2;
+
+  // coil axis along y, with a slow bend
+  float bend = sin(t * 0.4) * 0.5;
+  p.x += bend * p.y * 0.35;
+  p.z += cos(t * 0.3) * 0.4 * p.y * 0.35;
+
+  float turns = 5.0;
+  float height = 6.0;
+  float y = p.y;
+  float ang = y * turns * 6.28318 / height + t * 0.8;
+
+  // coil center path
+  vec2 c = vec2(cos(ang), sin(ang)) * 1.1;
+
+  // twist the tube cross-section: radius varies with angle along the coil
+  vec2 d = p.xz - c;
+  float ang2 = atan(d.y, d.x);
+  float twist = ang * 3.0 + t * 1.5;
+  float r = 0.28 + 0.12 * sin(ang2 * 3.0 + twist) + 0.08 * sin(ang2 * 5.0 - twist * 1.7);
+
+  // liquid bulbing along the coil
+  r += 0.06 * sin(y * 9.0 - t * 3.0);
+
+  return length(d) - r;
+}
+
+// a second smaller coil, offset, blended in for liquid feel
+float sdCoil2(vec3 p, float t) {
+  p.y -= 0.4 * sin(t * 0.5);
+  p.xz *= 0.55;
+  p.y *= 1.6;
+  return sdCoil(p, t * 1.3 + 2.0) * 1.6;
+}
+
+float map(vec3 p, float t) {
+  float a = sdCoil(p, t);
+  float b = sdCoil2(p, t);
+  return smin(a, b, 0.35);
+}
+
+vec3 calcNormal(vec3 p, float t) {
+  vec2 e = vec2(0.002, 0.0);
+  return normalize(vec3(
+    map(p - e.xyy, t) - map(p + e.xyy, t),
+    map(p - e.yxy, t) - map(p + e.yxy, t),
+    map(p - e.yyx, t) - map(p + e.yyx, t)
+  ));
+}
+
+float softShadow(vec3 ro, vec3 rd, float t) {
+  float res = 1.0, d = 0.02;
+  for (int i = 0; i < 24; i++) {
+    float h = map(ro + rd * d, t);
+    res = min(res, 9.0 * h / d);
+    d += max(h, 0.01);
+    if (res < 0.005 || d > 4.0) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+float calcAO(vec3 p, vec3 n, float t) {
+  float occ = 0.0, sca = 1.0;
+  for (int i = 0; i < 5; i++) {
+    float h = 0.02 + 0.11 * float(i) / 4.0;
+    occ += (h - map(p + n * h, t)) * sca;
+    sca *= 0.85;
+  }
+  return clamp(1.0 - 2.0 * occ, 0.0, 1.0);
+}
+
+vec3 palette(float f) {
+  return 0.5 + 0.5 * cos(6.28318 * (f + vec3(0.0, 0.33, 0.67)));
+}
+
+void main() {
+  vec2 uv = (2.0 * gl_FragCoord.xy - res) / res.y;
+  float t = time;
+
+  // slow orbiting camera
+  float ca = t * 0.25;
+  vec3 ro = vec3(2.6 * sin(ca), 0.6 * sin(t * 0.3), 2.6 * cos(ca));
+  vec3 ta = vec3(0.0, 0.0, 0.0);
+  vec3 fw = normalize(ta - ro);
+  vec3 rt = normalize(cross(fw, vec3(0.0, 1.0, 0.0)));
+  vec3 up = cross(rt, fw);
+  vec3 rd = normalize(fw * 1.6 + uv.x * rt + uv.y * up);
+
+  // raymarch
+  float d = 0.0;
+  float dist = 0.0;
+  vec3 p = ro;
+  bool hit = false;
+  for (int i = 0; i < MAX_STEPS; i++) {
+    p = ro + rd * dist;
+    d = map(p, t);
+    if (d < SURF || dist > MAX_DIST) { hit = d < SURF; break; }
+    dist += d * 0.9;
+  }
+
+  vec3 bg = mix(vec3(0.02, 0.03, 0.06), vec3(0.06, 0.02, 0.08), uv.y * 0.5 + 0.5);
+  bg += 0.02 * sin(uv.x * 3.0 + t) * sin(uv.y * 3.0 - t);
+  vec3 col = bg;
+
+  if (hit) {
+    vec3 n = calcNormal(p, t);
+    vec3 lig = normalize(vec3(0.6, 0.8, -0.4));
+    float dif = clamp(dot(n, lig), 0.0, 1.0);
+    float sh = softShadow(p + n * 0.02, lig, t);
+    float ao = calcAO(p, n, t);
+    float fre = pow(clamp(1.0 + dot(n, rd), 0.0, 1.0), 3.0);
+    float spe = pow(clamp(dot(reflect(rd, n), lig), 0.0, 1.0), 24.0);
+
+    // iridescent liquid color from normal + position
+    float f = p.y * 0.15 + dot(n, vec3(0.0, 1.0, 0.0)) * 0.3 + t * 0.05;
+    vec3 base = palette(f);
+
+    col = base * (0.15 + 0.85 * dif * sh) * ao;
+    col += fre * palette(f + 0.3) * 0.8;
+    col += spe * 0.6 * vec3(1.0, 0.95, 0.9);
+
+    // subsurface-ish glow
+    float sss = pow(clamp(dot(-rd, -lig), 0.0, 1.0), 3.0);
+    col += sss * base * 0.25 * ao;
+  }
+
+  // vignette + gamma
+  col *= 1.0 - 0.25 * dot(uv, uv);
+  col = pow(col, vec3(0.4545));
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const uRes = gl.getUniformLocation(prog, 'res');
+const uTime = gl.getUniformLocation(prog, 'time');
+
+function frame(now) {
+  resize();
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, now * 0.001);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
