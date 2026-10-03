@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Lissajous Gooey Blobs - Dark Purple + Pathfinding Lightning</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #050505; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+<script src="https://cdn.jsdelivr.net/npm/p5@1.9.0/lib/p5.min.js"></script>
+<script>
+let shaderProgram;
+let startTime;
+
+const vert = `
+    attribute vec3 aPosition;
+    attribute vec2 aTexCoord;
+    varying vec2 vTexCoord;
+    void main() {
+        vTexCoord = aTexCoord;
+        // p5's rect() geometry spans 0..1; remap to clip space -1..1 to cover the screen
+        gl_Position = vec4(aPosition.xy * 2.0 - 1.0, 0.0, 1.0);
+    }
+`;
+
+const frag = `
+    precision highp float;
+    varying vec2 vTexCoord;
+    uniform vec2 uResolution;
+    uniform float uTime;
+
+    const int blobCount = 5;
+    struct Blob {
+        vec2 center;
+        float amplitudeX;
+        float amplitudeY;
+        float freqX;
+        float freqY;
+        float phase;
+        vec3 color;
+    };
+    Blob blobs[blobCount];
+
+    void initBlobs() {
+        for (int i = 0; i < blobCount; i++) {
+            float seed = float(i);
+            blobs[i].amplitudeX = 0.45 + 0.25 * sin(seed * 12.9898);
+            blobs[i].amplitudeY = 0.38 + 0.20 * cos(seed * 78.233);
+            blobs[i].freqX = 1.0 + sin(seed * 4.3758);
+            blobs[i].freqY = 1.3 + cos(seed * 4.761);
+            blobs[i].phase = seed * 6.2831 / 5.0;
+            // Purple/violet palette: low green, mid red, high blue
+            float hue = seed / float(blobCount);
+            blobs[i].color = vec3(
+                0.35 + 0.30 * sin(6.2831 * (hue + 0.0)),
+                0.02 + 0.12 * sin(6.2831 * (hue + 0.33)),
+                0.65 + 0.35 * sin(6.2831 * (hue + 0.66))
+            );
+        }
+    }
+
+    void updateBlobs(float time) {
+        for (int i = 0; i < blobCount; i++) {
+            Blob b = blobs[i];
+            float t = time * 0.3 + b.phase;
+            float x = sin(t * b.freqX) * b.amplitudeX;
+            float y = sin(t * b.freqY) * b.amplitudeY;
+            blobs[i].center = vec2(x, y);
+        }
+    }
+
+    float metaball(vec2 pt, Blob b) {
+        float d = distance(pt, b.center);
+        return 0.008 / (d * d + 0.0001);
+    }
+
+    // ---------- Pathfinding forked lightning helpers ----------
+    float hash1(float p) {
+        p = fract(p * 0.1031);
+        p *= p + 33.33;
+        p *= p + p;
+        return fract(p);
+    }
+
+    float vnoise(float x) {
+        float i = floor(x);
+        float f = fract(x);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(hash1(i), hash1(i + 1.0), f);
+    }
+
+    float segDist(vec2 p, vec2 a, vec2 b) {
+        vec2 pa = p - a;
+        vec2 ba = b - a;
+        float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+        return length(pa - ba * h);
+    }
+
+    // Fractal lightning polyline point: fBm value-noise offset perpendicular to the axis,
+    // tapered to zero at both ends so bolts land exactly on the blob centres.
+    vec2 boltPoint(vec2 p0, vec2 p1, float t, float seed, float amp) {
+        vec2 dvec = p1 - p0;
+        float len = max(length(dvec), 1e-4);
+        vec2 dir = dvec / len;
+        vec2 perp = vec2(-dir.y, dir.x);
+        float off = 0.0;
+        for (int s = 0; s < 3; s++) {
+            float scale = pow(2.0, float(s));
+            float n = vnoise(t * 3.0 * scale + seed + scale * 7.13);
+            off += (n * 2.0 - 1.0) * amp / scale;
+        }
+        float taper = sin(t * 3.14159265);
+        return mix(p0, p1, t) + perp * off * taper;
+    }
+
+    void main() {
+        vec2 uv = gl_FragCoord.xy / uResolution.xy;
+        uv = uv * 2.0 - 1.0;
+        uv.x *= uResolution.x / uResolution.y;
+
+        initBlobs();
+        updateBlobs(uTime);
+
+        float field = 0.0;
+        vec3 colorSum = vec3(0.0);
+        for (int i = 0; i < blobCount; i++) {
+            float m = metaball(uv, blobs[i]);
+            field += m;
+            colorSum += blobs[i].color * m;
+        }
+
+        vec3 color = colorSum / max(field, 0.0001);
+
+        float melt = smoothstep(0.0, 12.0, uTime);
+        float threshold = 0.3 + melt * 0.4;
+        float mask = smoothstep(threshold - 0.05, threshold + 0.05, field);
+
+        // Dark grey / near-black body tint inside the goo
+        vec3 darkColor = vec3(0.06, 0.05, 0.08);
+        color = mix(color, darkColor, melt * 0.55);
+        color *= mask;
+
+        // Glowing purple rim: bright where the field just crosses the threshold
+        float rim = smoothstep(threshold - 0.12, threshold, field)
+                  * (1.0 - smoothstep(threshold, threshold + 0.35, field));
+        vec3 purple = vec3(0.65, 0.20, 1.0);
+        color += purple * rim * (0.35 + 0.12 * sin(uTime * 1.7));
+
+        // Soft outer glow bleeding into the darkness
+        float glow = pow(clamp(field / threshold, 0.0, 1.0), 2.5) * (1.0 - mask);
+        color += purple * glow * 0.12;
+
+        // Purple-white specular sheen
+        float spec = pow(field * 8.0, 2.0);
+        color += vec3(0.75, 0.55, 1.0) * spec * 0.10 * melt;
+
+        // Faint dark-grey backdrop so pure black only sits at the edges
+        float dist = distance(uv, vec2(0.0));
+        vec3 backdrop = mix(vec3(0.10, 0.09, 0.12), vec3(0.0), smoothstep(0.4, 1.2, dist));
+        backdrop += purple * glow * 0.05;
+        color += backdrop * (1.0 - mask);
+
+        // ---- Pathfinding forked lightning ----
+        // Greedy nearest-neighbour route through the moving blob centres:
+        // start at blob 0, each hop jumps to the closest unvisited blob.
+        vec2 pathPts[blobCount];
+        float visited[blobCount];
+        for (int i = 0; i < blobCount; i++) {
+            visited[i] = 0.0;
+        }
+        pathPts[0] = blobs[0].center;
+        visited[0] = 1.0;
+        for (int step = 1; step < blobCount; step++) {
+            vec2 prev = pathPts[step - 1];
+            float bestD = 1e9;
+            vec2 bestP = prev;
+            float bestI = -1.0;
+            for (int i = 0; i < blobCount; i++) {
+                float d = visited[i] > 0.5 ? 1e9 : distance(prev, blobs[i].center);
+                if (d < bestD) {
+                    bestD = d;
+                    bestP = blobs[i].center;
+                    bestI = float(i);
+                }
+            }
+            pathPts[step] = bestP;
+            for (int i = 0; i < blobCount; i++) {
+                if (float(i) == bestI) {
+                    visited[i] = 1.0;
+                }
+            }
+        }
+
+        // Strike timing: re-roll the bolt geometry a few times per second with a decaying flash
+        float strikeIdx = floor(uTime * 2.5);
+        float strikeF = fract(uTime * 2.5);
+        float flash = exp(-strikeF * 3.0) * (0.75 + 0.25 * hash1(floor(uTime * 18.0)));
+        // A "search probe" that travels along the currently active route segment
+        float scanPos = fract(uTime * 0.35) * float(blobCount - 1);
+
+        float boltCore = 0.0;
+        float boltHalo = 0.0;
+        float guide = 0.0;
+
+        for (int k = 0; k < blobCount - 1; k++) {
+            vec2 p0 = pathPts[k];
+            vec2 p1 = pathPts[k + 1];
+            float len = max(distance(p0, p1), 1e-4);
+            vec2 dir = (p1 - p0) / len;
+            float dStraight = segDist(uv, p0, p1);
+
+            // Faint planned-route guide line + travelling scan pulse
+            guide += (1.0 - smoothstep(0.0, 0.0035, dStraight)) * 0.35;
+            float s = clamp(dot(uv - p0, dir) / len, 0.0, 1.0);
+            float scanActive = step(float(k), scanPos) * step(scanPos, float(k) + 1.0);
+            guide += (1.0 - smoothstep(0.0, 0.004, dStraight))
+                   * scanActive * exp(-abs(s - (scanPos - float(k))) * 10.0);
+
+            // Cheap cull: only pixels near the route build the expensive fractal bolts
+            if (dStraight < len * 0.35 + 0.06) {
+                float seed = strikeIdx * 31.7 + float(k) * 13.1;
+                float on = step(0.2, hash1(strikeIdx * 7.31 + float(k) * 3.7));
+
+                // Main bolt along the route hop
+                float dMin = 1e9;
+                vec2 prevPt = p0;
+                for (int j = 1; j <= 6; j++) {
+                    vec2 pt = boltPoint(p0, p1, float(j) / 6.0, seed, len * 0.16);
+                    dMin = min(dMin, segDist(uv, prevPt, pt));
+                    prevPt = pt;
+                }
+                boltCore += (1.0 - smoothstep(0.0, 0.006, dMin)) * on;
+                boltHalo += exp(-dMin * 26.0) * on;
+
+                // Two forked branches sprouting off the main bolt
+                for (int f = 0; f < 2; f++) {
+                    float fseed = seed + float(f) * 17.0;
+                    float tf = 0.25 + 0.5 * hash1(fseed + 5.0);
+                    vec2 origin = boltPoint(p0, p1, tf, seed, len * 0.16);
+                    float side = float(f) * 2.0 - 1.0;
+                    float ang = side * (0.45 + 0.7 * hash1(fseed + 9.0));
+                    float ca = cos(ang);
+                    float sa = sin(ang);
+                    vec2 fdir = vec2(dir.x * ca - dir.y * sa, dir.x * sa + dir.y * ca);
+                    vec2 fend = origin + fdir * len * (0.22 + 0.18 * hash1(fseed + 2.0));
+                    float fdMin = 1e9;
+                    vec2 fPrev = origin;
+                    for (int j = 1; j <= 3; j++) {
+                        vec2 pt = boltPoint(origin, fend, float(j) / 3.0, fseed + 11.0, len * 0.07);
+                        fdMin = min(fdMin, segDist(uv, fPrev, pt));
+                        fPrev = pt;
+                    }
+                    boltCore += (1.0 - smoothstep(0.0, 0.004, fdMin)) * 0.6 * on;
+                    boltHalo += exp(-fdMin * 28.0) * 0.5 * on;
+                }
+            }
+        }
+
+        // Composite: blue halo, white-hot blue core, dim route guide
+        vec3 boltCol = vec3(0.20, 0.55, 1.0);
+        color += boltCol * boltHalo * 0.55 * flash;
+        color += mix(boltCol, vec3(0.75, 0.90, 1.0), 0.7) * boltCore * 1.5 * flash;
+        color += vec3(0.20, 0.45, 0.95) * guide * 0.18;
+
+        float vignette = smoothstep(0.9, 0.45, dist);
+        color *= vignette;
+
+        gl_FragColor = vec4(color, 1.0);
+    }
+`;
+
+function setup() {
+    createCanvas(windowWidth, windowHeight, WEBGL);
+    shaderProgram = createShader(vert, frag);
+    startTime = millis() / 1000.0;
+}
+
+function draw() {
+    let elapsed = millis() / 1000.0 - startTime;
+
+    shader(shaderProgram);
+    // gl_FragCoord is in device pixels, so scale by pixel density
+    shaderProgram.setUniform('uResolution', [width * pixelDensity(), height * pixelDensity()]);
+    shaderProgram.setUniform('uTime', elapsed);
+
+    // Fullscreen quad; the vertex shader maps it straight to clip space
+    rect(0, 0, width, height);
+}
+
+function windowResized() {
+    resizeCanvas(windowWidth, windowHeight);
+}
+
+// Click to toggle browser fullscreen
+function mousePressed() {
+    fullscreen(!fullscreen());
+}
+</script>
+</body>
+</html>

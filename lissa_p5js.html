@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Lissajous Gooey Blobs - p5.js</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+<script src="https://cdn.jsdelivr.net/npm/p5@1.9.0/lib/p5.min.js"></script>
+<script>
+let shaderProgram;
+let startTime;
+
+const vert = `
+    attribute vec3 aPosition;
+    attribute vec2 aTexCoord;
+    varying vec2 vTexCoord;
+    void main() {
+        vTexCoord = aTexCoord;
+        // p5's rect() geometry spans 0..1; remap to clip space -1..1 to cover the screen
+        gl_Position = vec4(aPosition.xy * 2.0 - 1.0, 0.0, 1.0);
+    }
+`;
+
+const frag = `
+    precision highp float;
+    varying vec2 vTexCoord;
+    uniform vec2 uResolution;
+    uniform float uTime;
+
+    const int blobCount = 5;
+    struct Blob {
+        vec2 center;
+        float amplitudeX;
+        float amplitudeY;
+        float freqX;
+        float freqY;
+        float phase;
+        vec3 color;
+    };
+    Blob blobs[blobCount];
+
+    void initBlobs() {
+        for (int i = 0; i < blobCount; i++) {
+            float seed = float(i);
+            blobs[i].amplitudeX = 0.3 + 0.2 * sin(seed * 12.9898);
+            blobs[i].amplitudeY = 0.25 + 0.15 * cos(seed * 78.233);
+            blobs[i].freqX = 1.0 + sin(seed * 4.3758);
+            blobs[i].freqY = 1.3 + cos(seed * 4.761);
+            blobs[i].phase = seed * 6.2831 / 5.0;
+            float hue = seed / float(blobCount);
+            blobs[i].color = vec3(
+                sin(6.2831 * (hue + 0.0)),
+                sin(6.2831 * (hue + 0.33)),
+                sin(6.2831 * (hue + 0.66))
+            ) * 0.8 + 0.2;
+        }
+    }
+
+    void updateBlobs(float time) {
+        for (int i = 0; i < blobCount; i++) {
+            Blob b = blobs[i];
+            float t = time * 0.3 + b.phase;
+            float x = sin(t * b.freqX) * b.amplitudeX;
+            float y = sin(t * b.freqY) * b.amplitudeY;
+            blobs[i].center = vec2(x, y);
+        }
+    }
+
+    float metaball(vec2 pt, Blob b) {
+        float d = distance(pt, b.center);
+        return 0.008 / (d * d + 0.0001);
+    }
+
+    void main() {
+        vec2 uv = gl_FragCoord.xy / uResolution.xy;
+        uv = uv * 2.0 - 1.0;
+        uv.x *= uResolution.x / uResolution.y;
+
+        initBlobs();
+        updateBlobs(uTime);
+
+        float field = 0.0;
+        vec3 colorSum = vec3(0.0);
+        for (int i = 0; i < blobCount; i++) {
+            float m = metaball(uv, blobs[i]);
+            field += m;
+            colorSum += blobs[i].color * m;
+        }
+
+        vec3 color = colorSum / max(field, 0.0001);
+
+        float melt = smoothstep(0.0, 12.0, uTime);
+        float threshold = 0.3 + melt * 0.4;
+        float mask = smoothstep(threshold - 0.05, threshold + 0.05, field);
+
+        vec3 glassColor = vec3(0.0, 0.0, 0.15);
+        color = mix(color, glassColor, melt * 0.7);
+        color *= mask;
+
+        float spec = pow(field * 8.0, 2.0);
+        color += vec3(0.2, 0.25, 0.3) * spec * 0.3 * melt;
+
+        float vignette = smoothstep(0.8, 0.5, distance(uv, vec2(0.0)));
+        color *= vignette;
+
+        gl_FragColor = vec4(color, 1.0);
+    }
+`;
+
+function setup() {
+    createCanvas(windowWidth, windowHeight, WEBGL);
+    shaderProgram = createShader(vert, frag);
+    startTime = millis() / 1000.0;
+}
+
+function draw() {
+    let elapsed = millis() / 1000.0 - startTime;
+
+    shader(shaderProgram);
+    // gl_FragCoord is in device pixels, so scale by pixel density
+    shaderProgram.setUniform('uResolution', [width * pixelDensity(), height * pixelDensity()]);
+    shaderProgram.setUniform('uTime', elapsed);
+
+    // Fullscreen quad; the vertex shader maps it straight to clip space
+    rect(0, 0, width, height);
+}
+
+function windowResized() {
+    resizeCanvas(windowWidth, windowHeight);
+}
+
+// Click to toggle browser fullscreen
+function mousePressed() {
+    fullscreen(!fullscreen());
+}
+</script>
+</body>
+</html>
