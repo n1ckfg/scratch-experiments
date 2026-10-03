@@ -328,7 +328,8 @@ void main() {
     fragColor = vec4(bgCol, 1.0);
 }`;
 
-const vsSource2 = `attribute vec4 a_position;
+const vsSource2 = `#version 300 es
+in vec4 a_position;
 void main() { gl_Position = a_position; }`;
 
 const fsSource2 = `#version 300 es
@@ -660,6 +661,7 @@ function createProgram(gl, vs, fs) {
 const vs = createShader(gl, gl.VERTEX_SHADER, vsSource2);
 const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource2);
 const program = createProgram(gl, vs, fs);
+gl.useProgram(program);
 
 const posBuffer = gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
@@ -671,8 +673,6 @@ gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
 const uRes = gl.getUniformLocation(program, 'u_res');
 const uTime = gl.getUniformLocation(program, 'u_time');
-
-gl.enable(gl.DEPTH_TEST);
 
 function render(time) {
     gl.uniform2f(uRes, canvas.width, canvas.height);
